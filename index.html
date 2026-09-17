@@ -109,6 +109,32 @@
     background:var(--bg-card); border:1px solid var(--line); color:var(--ink);
     font-size:11.5px; padding:7px 10px; border-radius:7px; white-space:nowrap;
   }
+  .tabbar{
+    display:flex; gap:6px; margin-top:10px;
+  }
+  .tabbar .tabbtn{
+    flex:1; padding:9px 4px; border-radius:8px; border:1px solid var(--line);
+    background:var(--bg-panel); color:var(--ink-dim); font-size:12px; font-family:var(--sans);
+  }
+  .tabbar .tabbtn.active{
+    background:var(--tag); color:var(--tag-ink); border-color:var(--tag); font-weight:700;
+  }
+  .shotgrid{
+    display:grid; grid-template-columns:repeat(2,1fr); gap:3px;
+    width:104px; min-width:104px; align-content:start;
+  }
+  .shotcell{
+    position:relative; aspect-ratio:1/1; background:#0e0f12; border-radius:6px;
+    overflow:hidden; cursor:pointer; display:flex; align-items:center; justify-content:center;
+  }
+  .shotcell img{ width:100%; height:100%; object-fit:cover; display:block; }
+  .shotcell.empty{
+    border:1px dashed var(--line); color:var(--ink-dim); font-size:10px; text-align:center; padding:2px;
+  }
+  .shotlabel{
+    position:absolute; left:0; right:0; bottom:0; background:rgba(0,0,0,.55);
+    color:#fff; font-size:9px; text-align:center; padding:1px 0;
+  }
 
   /* modal */
   .overlay{
@@ -200,6 +226,13 @@
     <button id="btnExport">匯出備份</button>
     <button id="btnImport">匯入備份</button>
     <button id="btnPrint">列印 / PDF</button>
+  </div>
+
+  <div class="tabbar" id="tabBar" style="display:none;">
+    <button class="tabbtn" data-tab="items">證物</button>
+    <button class="tabbtn" data-tab="environment">地點門牌</button>
+    <button class="tabbtn" data-tab="layout">現場格局</button>
+    <button class="tabbtn" data-tab="other">其他</button>
   </div>
 
   <div class="prefixbar" id="prefixBar" style="display:none;">
@@ -605,7 +638,7 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var n,r,i,a,
   var LS_ACTIVE = "ev_active_case";
   var LS_CASE_PREFIX = "ev_case_";
 
-  var state = { caseId: null, data: null };
+  var state = { caseId: null, data: null, activeTab: "items" };
 
   function uid(){ return Date.now().toString(36) + Math.random().toString(36).slice(2,7); }
   function pad(n,len){ n=String(n); while(n.length<len) n="0"+n; return n; }
@@ -644,6 +677,47 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var n,r,i,a,
     return { text: prefix ? (prefix + n) : String(n), prefix: prefix, seq: n };
   }
 
+  // ---------- evidence photo shots (far / medium / near / macro) ----------
+  var SHOT_TYPES = [
+    {key:"far",    label:"遠景"},
+    {key:"medium", label:"中景"},
+    {key:"near",   label:"近景"},
+    {key:"macro",  label:"特寫"}
+  ];
+
+  function shotLabel(key){
+    var f = SHOT_TYPES.filter(function(s){ return s.key === key; })[0];
+    return f ? f.label : key;
+  }
+
+  function ensureShots(item){
+    if(!item.shots){
+      item.shots = {far:null, medium:null, near:null, macro:null};
+      // Migrate items created before this feature existed (single `photo` field).
+      if(item.photo){ item.shots.near = item.photo; }
+    }
+    return item.shots;
+  }
+
+  // ---------- case-level photo sections (location / layout / other) ----------
+  var SECTIONS = [
+    {key:"environment", label:"地點門牌（環境）"},
+    {key:"layout",       label:"現場格局"},
+    {key:"other",        label:"其他"}
+  ];
+
+  function sectionLabel(key){
+    var f = SECTIONS.filter(function(s){ return s.key === key; })[0];
+    return f ? f.label : key;
+  }
+
+  function ensureSections(d){
+    if(!d.sections) d.sections = {};
+    SECTIONS.forEach(function(s){
+      if(!d.sections[s.key]) d.sections[s.key] = [];
+    });
+  }
+
   function todayStr(){ var d=new Date(); return d.getFullYear()+"-"+pad(d.getMonth()+1,2)+"-"+pad(d.getDate(),2); }
   function nowTimeStr(){ var d=new Date(); return pad(d.getHours(),2)+":"+pad(d.getMinutes(),2); }
   function fullTimeStr(){ var d=new Date(); return todayStr()+" "+nowTimeStr(); }
@@ -674,11 +748,14 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var n,r,i,a,
     var initialPrefix = normalizePrefix(meta.prefix);
     var counters = {};
     counters[initialPrefix] = 0;
+    var sections = {};
+    SECTIONS.forEach(function(s){ sections[s.key] = []; });
     var data = {
       meta: meta,
       counters: counters,
       activePrefix: initialPrefix,
-      items: []
+      items: [],
+      sections: sections
     };
     localStorage.setItem(LS_CASE_PREFIX+id, JSON.stringify(data));
     var list = getCaseList();
@@ -692,8 +769,10 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var n,r,i,a,
     var data = loadCaseData(id);
     if(!data) return false;
     ensureCounters(data);
+    ensureSections(data);
     state.caseId = id;
     state.data = data;
+    state.activeTab = "items";
     localStorage.setItem(LS_ACTIVE, id);
     render();
     return true;
@@ -722,34 +801,61 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var n,r,i,a,
     var d = state.data;
     var grid = document.getElementById("grid");
     var empty = document.getElementById("emptyState");
+    var emptyBig = empty.querySelector(".big");
+    var emptySmall = empty.querySelector(".small");
     var title = document.getElementById("caseTitle");
     var line = document.getElementById("caseLine");
     var prefixBar = document.getElementById("prefixBar");
     var prefixBarLabel = document.getElementById("prefixBarLabel");
+    var tabBar = document.getElementById("tabBar");
 
     if(!d){
       title.textContent = "證物紀錄";
       line.innerHTML = "";
       grid.innerHTML = "";
       empty.style.display = "block";
+      emptyBig.textContent = "尚無案件";
+      emptySmall.innerHTML = '點右下角「＋」建立第一筆證物，<br>系統會自動開新案件並產生編號。';
       prefixBar.style.display = "none";
+      tabBar.style.display = "none";
       return;
     }
-    empty.style.display = d.items.length ? "none" : "block";
+
+    ensureSections(d);
     title.textContent = d.meta.caseNo || "未命名案件";
     line.innerHTML =
       (d.meta.location ? "<span>地點：<b>"+esc(d.meta.location)+"</b></span>" : "") +
       (d.meta.recorder ? "<span>記錄人：<b>"+esc(d.meta.recorder)+"</b></span>" : "") +
       (d.meta.date ? "<span>日期：<b>"+esc(d.meta.date)+"</b></span>" : "") +
-      "<span>共 <b>"+d.items.length+"</b> 件</span>";
+      "<span>共 <b>"+d.items.length+"</b> 件證物</span>";
 
-    prefixBar.style.display = "flex";
-    prefixBarLabel.textContent = d.activePrefix ? (d.activePrefix + "1, " + d.activePrefix + "2…") : "1、2、3…";
+    tabBar.style.display = "flex";
+    Array.prototype.forEach.call(tabBar.querySelectorAll(".tabbtn"), function(btn){
+      var on = btn.getAttribute("data-tab") === state.activeTab;
+      btn.classList.toggle("active", on);
+    });
 
     grid.innerHTML = "";
-    sortedItems(d).forEach(function(item){
-      grid.appendChild(renderCard(item));
-    });
+
+    if(state.activeTab === "items"){
+      prefixBar.style.display = "flex";
+      prefixBarLabel.textContent = d.activePrefix ? (d.activePrefix + "1, " + d.activePrefix + "2…") : "1、2、3…";
+      empty.style.display = d.items.length ? "none" : "block";
+      emptyBig.textContent = "尚無證物";
+      emptySmall.innerHTML = '點右下角「＋」拍下第一件證物，<br>會自動產生編號並開始拍遠景。';
+      sortedItems(d).forEach(function(item){
+        grid.appendChild(renderCard(item));
+      });
+    } else {
+      prefixBar.style.display = "none";
+      var list = d.sections[state.activeTab] || [];
+      empty.style.display = list.length ? "none" : "block";
+      emptyBig.textContent = "尚無照片";
+      emptySmall.innerHTML = '點右下角「＋」新增「'+esc(sectionLabel(state.activeTab))+'」的照片。';
+      list.forEach(function(entry){
+        grid.appendChild(renderSectionCard(entry, state.activeTab));
+      });
+    }
   }
 
   function esc(s){
@@ -761,22 +867,36 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var n,r,i,a,
   function renderCard(item){
     var card = document.createElement("div");
     card.className = "card";
+    var shots = ensureShots(item);
 
-    var thumb = document.createElement("div");
-    thumb.className = "thumb";
-    if(item.photo){
-      var img = document.createElement("img");
-      img.src = item.photo;
-      thumb.appendChild(img);
-      thumb.addEventListener("click", function(){ openViewer(item); });
-    } else {
-      var ni = document.createElement("div");
-      ni.className = "noimg";
-      ni.textContent = "無照片\n點右側新增";
-      thumb.appendChild(ni);
-      thumb.addEventListener("click", function(){ addPhotoToItem(item); });
-    }
-    card.appendChild(thumb);
+    var grid = document.createElement("div");
+    grid.className = "shotgrid";
+    SHOT_TYPES.forEach(function(st){
+      var cell = document.createElement("div");
+      cell.className = "shotcell";
+      var photo = shots[st.key];
+      if(photo){
+        var img = document.createElement("img");
+        img.src = photo;
+        cell.appendChild(img);
+        var lbl = document.createElement("span");
+        lbl.className = "shotlabel";
+        lbl.textContent = st.label;
+        cell.appendChild(lbl);
+        cell.addEventListener("click", function(){
+          openViewer(photo, item.number + "・" + st.label,
+            function(){ addPhotoToItemShot(item, st.key); },
+            function(){ shots[st.key] = null; saveCaseData(); render(); }
+          );
+        });
+      } else {
+        cell.classList.add("empty");
+        cell.textContent = "＋ " + st.label;
+        cell.addEventListener("click", function(){ addPhotoToItemShot(item, st.key); });
+      }
+      grid.appendChild(cell);
+    });
+    card.appendChild(grid);
 
     var body = document.createElement("div");
     body.className = "body";
@@ -811,28 +931,88 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var n,r,i,a,
 
     var row2 = document.createElement("div");
     row2.className = "row2";
+    var del = document.createElement("button");
+    del.className = "iconbtn danger";
+    del.textContent = "刪除整筆";
+    del.addEventListener("click", function(){ confirmDelete(item); });
+    row2.appendChild(del);
+    body.appendChild(row2);
 
-    if(!item.photo){
+    card.appendChild(body);
+    return card;
+  }
+
+  function renderSectionCard(entry, sectionKey){
+    var card = document.createElement("div");
+    card.className = "card";
+
+    var thumb = document.createElement("div");
+    thumb.className = "thumb";
+    if(entry.photo){
+      var img = document.createElement("img");
+      img.src = entry.photo;
+      thumb.appendChild(img);
+      thumb.addEventListener("click", function(){
+        openViewer(entry.photo, sectionLabel(sectionKey),
+          function(){ retakeSectionPhoto(entry); },
+          function(){ entry.photo = null; saveCaseData(); render(); }
+        );
+      });
+    } else {
+      var ni = document.createElement("div");
+      ni.className = "noimg";
+      ni.textContent = "無照片\n點右側拍照";
+      thumb.appendChild(ni);
+      thumb.addEventListener("click", function(){ retakeSectionPhoto(entry); });
+    }
+    card.appendChild(thumb);
+
+    var body = document.createElement("div");
+    body.className = "body";
+
+    var row1 = document.createElement("div");
+    row1.className = "row1";
+    var time = document.createElement("span");
+    time.className = "time";
+    time.textContent = entry.time;
+    row1.appendChild(time);
+    body.appendChild(row1);
+
+    var note = document.createElement("textarea");
+    note.className = "note";
+    note.placeholder = "說明 / 備註…";
+    note.value = entry.note || "";
+    note.rows = 1;
+    autoGrow(note);
+    note.addEventListener("input", function(){
+      autoGrow(note);
+      entry.note = note.value;
+      saveCaseData();
+    });
+    body.appendChild(note);
+
+    var row2 = document.createElement("div");
+    row2.className = "row2";
+    if(!entry.photo){
       var addP = document.createElement("button");
       addP.className = "iconbtn";
       addP.textContent = "拍照";
-      addP.addEventListener("click", function(){ addPhotoToItem(item); });
+      addP.addEventListener("click", function(){ retakeSectionPhoto(entry); });
       row2.appendChild(addP);
     } else {
       var retake = document.createElement("button");
       retake.className = "iconbtn";
       retake.textContent = "重拍";
-      retake.addEventListener("click", function(){ addPhotoToItem(item); });
+      retake.addEventListener("click", function(){ retakeSectionPhoto(entry); });
       row2.appendChild(retake);
     }
-
     var del = document.createElement("button");
     del.className = "iconbtn danger";
     del.textContent = "刪除";
-    del.addEventListener("click", function(){ confirmDelete(item); });
+    del.addEventListener("click", function(){ confirmDeleteSectionEntry(sectionKey, entry); });
     row2.appendChild(del);
-
     body.appendChild(row2);
+
     card.appendChild(body);
     return card;
   }
@@ -842,15 +1022,35 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var n,r,i,a,
     ta.style.height = ta.scrollHeight + "px";
   }
 
+  // ---------- tabs ----------
+  Array.prototype.forEach.call(document.querySelectorAll(".tabbtn"), function(btn){
+    btn.addEventListener("click", function(){
+      state.activeTab = btn.getAttribute("data-tab");
+      render();
+    });
+  });
+
   // ---------- add / photo ----------
-  var pendingPhotoTarget = null; // null = new item flow
+  // A single generalized capture pipeline: whoever wants a photo calls
+  // capturePhoto(callback) and gets the compressed data URL back, regardless
+  // of whether it's going into an evidence shot slot or a section entry.
+  var pendingPhotoCallback = null;
+
+  function capturePhoto(onDone){
+    pendingPhotoCallback = onDone;
+    document.getElementById("fileInput").click();
+  }
 
   document.getElementById("btnAdd").addEventListener("click", function(){
     if(!state.caseId){
       openCaseEditor(true);
       return;
     }
-    createItemAndCapture();
+    if(state.activeTab === "items"){
+      createItemAndCapture();
+    } else {
+      addSectionPhoto(state.activeTab);
+    }
   });
 
   function createItemAndCapture(){
@@ -861,34 +1061,55 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var n,r,i,a,
       number: numInfo.text,
       prefix: numInfo.prefix,
       seq: numInfo.seq,
-      photo: null,
+      shots: {far:null, medium:null, near:null, macro:null},
       note: "",
       time: fullTimeStr()
     };
     d.items.push(item);
     saveCaseData();
     render();
-    pendingPhotoTarget = item;
-    document.getElementById("fileInput").click();
+    addPhotoToItemShot(item, "far");
   }
 
-  function addPhotoToItem(item){
-    pendingPhotoTarget = item;
-    document.getElementById("fileInput").click();
+  function addPhotoToItemShot(item, shotKey){
+    capturePhoto(function(dataUrl){
+      ensureShots(item)[shotKey] = dataUrl;
+      saveCaseData();
+      render();
+      toast("已存入 " + item.number + "・" + shotLabel(shotKey));
+    });
+  }
+
+  function addSectionPhoto(sectionKey){
+    var d = state.data;
+    ensureSections(d);
+    var entry = { id: uid(), photo: null, note: "", time: fullTimeStr() };
+    d.sections[sectionKey].push(entry);
+    saveCaseData();
+    render();
+    capturePhoto(function(dataUrl){
+      entry.photo = dataUrl;
+      saveCaseData();
+      render();
+      toast("已新增「" + sectionLabel(sectionKey) + "」照片");
+    });
+  }
+
+  function retakeSectionPhoto(entry){
+    capturePhoto(function(dataUrl){
+      entry.photo = dataUrl;
+      saveCaseData();
+      render();
+    });
   }
 
   document.getElementById("fileInput").addEventListener("change", function(e){
     var file = e.target.files && e.target.files[0];
     this.value = "";
-    if(!file || !pendingPhotoTarget) return;
-    var target = pendingPhotoTarget;
-    pendingPhotoTarget = null;
-    compressImage(file, function(dataUrl){
-      target.photo = dataUrl;
-      saveCaseData();
-      render();
-      toast("已存入 "+target.number);
-    });
+    if(!file || !pendingPhotoCallback) return;
+    var cb = pendingPhotoCallback;
+    pendingPhotoCallback = null;
+    compressImage(file, cb);
   });
 
   function compressImage(file, cb){
@@ -915,12 +1136,30 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var n,r,i,a,
   function confirmDelete(item){
     openModal(
       "刪除這筆證物？",
-      '<div class="hint" style="margin-bottom:16px;">編號 '+esc(item.number)+' 將被永久刪除，此動作無法復原。</div>',
+      '<div class="hint" style="margin-bottom:16px;">編號 '+esc(item.number)+'（含所有已拍的照片）將被永久刪除，此動作無法復原。</div>',
       [
         {label:"取消", cls:"ghost"},
         {label:"刪除", cls:"danger", action:function(){
           var d = state.data;
           d.items = d.items.filter(function(i){ return i.id !== item.id; });
+          saveCaseData();
+          render();
+          toast("已刪除");
+        }}
+      ]
+    );
+  }
+
+  function confirmDeleteSectionEntry(sectionKey, entry){
+    openModal(
+      "刪除這張照片？",
+      '<div class="hint" style="margin-bottom:16px;">此動作無法復原。</div>',
+      [
+        {label:"取消", cls:"ghost"},
+        {label:"刪除", cls:"danger", action:function(){
+          var d = state.data;
+          ensureSections(d);
+          d.sections[sectionKey] = d.sections[sectionKey].filter(function(e){ return e.id !== entry.id; });
           saveCaseData();
           render();
           toast("已刪除");
@@ -947,14 +1186,23 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var n,r,i,a,
   }
 
   // ---------- viewer ----------
-  function openViewer(item){
+  function openViewer(dataUrl, label, onRetake, onDelete){
     var v = document.createElement("div");
     v.className = "viewer";
     v.innerHTML =
-      '<img src="'+item.photo+'">' +
-      '<div class="vbar"><span class="vnum">'+esc(item.number)+'</span><button id="vClose">關閉</button></div>';
+      '<img src="'+dataUrl+'">' +
+      '<div class="vbar">' +
+        '<span class="vnum">'+esc(label)+'</span>' +
+        '<div style="display:flex; gap:8px;">' +
+          (onRetake ? '<button id="vRetake">重拍</button>' : '') +
+          (onDelete ? '<button id="vDelete" style="color:var(--danger); border-color:var(--danger);">刪除</button>' : '') +
+          '<button id="vClose">關閉</button>' +
+        '</div>' +
+      '</div>';
     document.body.appendChild(v);
     v.querySelector("#vClose").addEventListener("click", function(){ v.remove(); });
+    if(onRetake){ v.querySelector("#vRetake").addEventListener("click", function(){ v.remove(); onRetake(); }); }
+    if(onDelete){ v.querySelector("#vDelete").addEventListener("click", function(){ v.remove(); onDelete(); }); }
     v.addEventListener("click", function(e){ if(e.target===v) v.remove(); });
   }
 
@@ -1250,6 +1498,7 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var n,r,i,a,
   // ---------- plain-text list (fallback if PDF generation isn't available) ----------
   function showTextListModal(){
     var d = state.data;
+    ensureSections(d);
     var lines = [];
     lines.push("案件："+(d.meta.caseNo||""));
     if(d.meta.location) lines.push("地點："+d.meta.location);
@@ -1257,11 +1506,26 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var n,r,i,a,
     if(d.meta.date) lines.push("日期："+d.meta.date);
     lines.push("共 "+d.items.length+" 件證物");
     lines.push("");
+
+    SECTIONS.forEach(function(s){
+      var list = d.sections[s.key] || [];
+      if(!list.length) return;
+      lines.push("【"+s.label+"】");
+      list.forEach(function(entry){
+        lines.push(entry.time+"　"+(entry.note ? entry.note : "（無說明）"));
+      });
+      lines.push("");
+    });
+
+    lines.push("【證物】");
     d.items.forEach(function(item){
-      lines.push(item.number+"　"+item.time);
+      var shots = ensureShots(item);
+      var have = SHOT_TYPES.filter(function(st){ return !!shots[st.key]; }).map(function(st){ return st.label; });
+      lines.push(item.number+"　"+item.time+"　已拍攝："+(have.length ? have.join("、") : "無"));
       lines.push(item.note ? item.note : "（無說明）");
       lines.push("");
     });
+
     var text = lines.join("\n");
     var html =
       '<div class="hint" style="margin-bottom:10px;">這是純文字的證物清單（不含照片）。複製後貼到備忘錄，就能用備忘錄本身的「列印」功能印出或存成 PDF。</div>' +
@@ -1286,8 +1550,43 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var n,r,i,a,
     });
   }
 
+  // Lays out up to 4 labelled images in a grid within the given area.
+  function addPhotoGridToPdf(doc, images, margin, top, pageW, pageH){
+    var cols = images.length > 1 ? 2 : 1;
+    var gap = 10;
+    var cellW = (pageW - margin * 2 - gap * (cols - 1)) / cols;
+    var availH = pageH - top - margin;
+    var rows = Math.max(1, Math.ceil(images.length / cols));
+    var cellH = (availH - gap * (rows - 1)) / rows;
+
+    var chain = Promise.resolve();
+    images.forEach(function(info, idx){
+      chain = chain.then(function(){
+        return loadImageMeta(info.dataUrl).then(function(meta){
+          var col = idx % cols;
+          var row = Math.floor(idx / cols);
+          var cellX = margin + col * (cellW + gap);
+          var cellY = top + row * (cellH + gap);
+          var labelH = 12;
+          var w = meta.width || cellW;
+          var h = meta.height || (cellH - labelH);
+          var scale = Math.min(cellW / w, (cellH - labelH) / h, 1);
+          var drawW = w * scale;
+          var drawH = h * scale;
+          var drawX = cellX + (cellW - drawW) / 2;
+          try{ doc.addImage(info.dataUrl, "JPEG", drawX, cellY, drawW, drawH); }catch(e){}
+          doc.setFont("helvetica", "normal");
+          doc.setFontSize(8);
+          doc.text(info.label, cellX, cellY + cellH - 2);
+        });
+      });
+    });
+    return chain;
+  }
+
   function buildPdf(){
     var d = state.data;
+    ensureSections(d);
     var JsPDF = window.jspdf && window.jspdf.jsPDF;
     if(!JsPDF) return Promise.reject(new Error("jsPDF not available"));
     var doc = new JsPDF({unit:"pt", format:"a4"});
@@ -1307,7 +1606,44 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var n,r,i,a,
     doc.text("Total items: " + d.items.length, margin, y);
 
     var chain = Promise.resolve();
-    d.items.forEach(function(item, idx){
+
+    function addSectionPages(sectionKey, title){
+      var list = d.sections[sectionKey] || [];
+      list.forEach(function(entry){
+        chain = chain.then(function(){
+          doc.addPage();
+          var yy = 50;
+          doc.setFont("helvetica", "bold");
+          doc.setFontSize(13);
+          doc.text(title, margin, yy);
+          doc.setFont("helvetica", "normal");
+          doc.setFontSize(9);
+          doc.text(String(entry.time || ""), pageW - margin - 100, yy);
+          yy += 18;
+          if(entry.note){
+            doc.setFontSize(10);
+            var lines = doc.splitTextToSize(entry.note, pageW - margin * 2);
+            doc.text(lines, margin, yy);
+            yy += lines.length * 13 + 8;
+          }
+          if(entry.photo){
+            return loadImageMeta(entry.photo).then(function(meta){
+              var maxW = pageW - margin * 2;
+              var maxH = pageH - yy - margin;
+              var w = meta.width || maxW;
+              var h = meta.height || maxH;
+              var scale = Math.min(maxW / w, maxH / h, 1);
+              try{ doc.addImage(entry.photo, "JPEG", margin, yy, w * scale, h * scale); }catch(e){}
+            });
+          }
+        });
+      });
+    }
+
+    addSectionPages("environment", "Location / Signage (地點門牌)");
+    addSectionPages("layout", "Scene Layout (現場格局)");
+
+    d.items.forEach(function(item){
       chain = chain.then(function(){
         doc.addPage();
         var yy = 50;
@@ -1322,22 +1658,19 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var n,r,i,a,
           doc.setFontSize(10);
           var lines = doc.splitTextToSize(item.note, pageW - margin * 2);
           doc.text(lines, margin, yy);
-          yy += lines.length * 13 + 8;
+          yy += lines.length * 13 + 10;
         }
-        if(item.photo){
-          return loadImageMeta(item.photo).then(function(meta){
-            var maxW = pageW - margin * 2;
-            var maxH = pageH - yy - margin;
-            var w = meta.width || maxW;
-            var h = meta.height || maxH;
-            var scale = Math.min(maxW / w, maxH / h, 1);
-            var drawW = w * scale;
-            var drawH = h * scale;
-            try{ doc.addImage(item.photo, "JPEG", margin, yy, drawW, drawH); }catch(e){}
-          });
+        var shots = ensureShots(item);
+        var images = SHOT_TYPES
+          .map(function(st){ return {label: st.label, dataUrl: shots[st.key]}; })
+          .filter(function(x){ return !!x.dataUrl; });
+        if(images.length){
+          return addPhotoGridToPdf(doc, images, margin, yy, pageW, pageH);
         }
       });
     });
+
+    addSectionPages("other", "Other (其他)");
 
     return chain.then(function(){ return doc; });
   }
@@ -1382,7 +1715,9 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var n,r,i,a,
 
   document.getElementById("btnPrint").addEventListener("click", function(){
     if(!state.data){ toast("尚無案件可匯出"); return; }
-    if(!state.data.items.length){ toast("尚無證物可匯出"); return; }
+    ensureSections(state.data);
+    var hasSectionPhotos = SECTIONS.some(function(s){ return (state.data.sections[s.key]||[]).length > 0; });
+    if(!state.data.items.length && !hasSectionPhotos){ toast("尚無任何照片可匯出"); return; }
     toast("正在製作 PDF…");
     buildPdf().then(function(doc){
       var blob = doc.output("blob");
