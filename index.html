@@ -70,6 +70,7 @@
   .num-tag{
     font-family:var(--mono); font-weight:700; font-size:14px; color:var(--tag-ink);
     background:var(--tag); padding:2px 8px; border-radius:5px; letter-spacing:.02em; white-space:nowrap;
+    border:none; cursor:pointer;
   }
   .card .time{font-size:11px; color:var(--ink-dim); font-family:var(--mono); white-space:nowrap;}
   .card textarea.note{
@@ -97,6 +98,16 @@
   .toolbar button{
     flex:1; min-width:74px; background:var(--bg-panel); border:1px solid var(--line); color:var(--ink-dim);
     font-size:12px; padding:8px 6px; border-radius:8px; font-family:var(--sans);
+  }
+  .prefixbar{
+    display:flex; align-items:center; justify-content:space-between; gap:10px;
+    margin-top:10px; padding:9px 12px; background:var(--bg-panel); border:1px solid var(--line); border-radius:8px;
+    font-size:12.5px; color:var(--ink-dim);
+  }
+  .prefixbar b{ color:var(--tag); font-family:var(--mono); }
+  .prefixbar button{
+    background:var(--bg-card); border:1px solid var(--line); color:var(--ink);
+    font-size:11.5px; padding:7px 10px; border-radius:7px; white-space:nowrap;
   }
 
   /* modal */
@@ -189,6 +200,11 @@
     <button id="btnExport">匯出備份</button>
     <button id="btnImport">匯入備份</button>
     <button id="btnPrint">列印 / PDF</button>
+  </div>
+
+  <div class="prefixbar" id="prefixBar" style="display:none;">
+    <span>目前編號：<b id="prefixBarLabel">1、2、3…</b></span>
+    <button id="btnSwitchPrefix">切換／新增編號</button>
   </div>
 
   <div id="emptyState" class="empty" style="display:none;">
@@ -594,22 +610,40 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var n,r,i,a,
   function uid(){ return Date.now().toString(36) + Math.random().toString(36).slice(2,7); }
   function pad(n,len){ n=String(n); while(n.length<len) n="0"+n; return n; }
 
-  // Builds the next evidence number for a case, according to its chosen format.
-  // Also increments the case's counter. d.numberFormat: 'plain' | 'prefixNum' | 'prefixPad'
-  function makeNumber(d){
-    d.counter += 1;
-    var n = d.counter;
-    var prefix = (d.prefix || "").trim();
-    var fmt = d.numberFormat || "prefixPad";
-    if(fmt === "plain"){
-      return String(n);
-    }
-    if(fmt === "prefixNum"){
-      return prefix + String(n);
-    }
-    // prefixPad (default): A-001 style; if no prefix, just 001
-    return (prefix ? prefix + "-" : "") + pad(n, 3);
+  // ---------- evidence numbering ----------
+  // Each case can have several independent numbering "groups" running at once
+  // (no prefix -> 1,2,3…; prefix "A" -> A1,A2,A3…; prefix "B" -> B1,B2,B3…).
+  // d.counters maps prefix ("" for none) -> next number to assign.
+  // d.activePrefix is whichever group is currently selected for new captures.
+  function normalizePrefix(p){
+    return (p || "").trim().toUpperCase();
   }
+
+  function ensureCounters(d){
+    if(!d.counters) d.counters = {};
+    if(typeof d.activePrefix !== "string") d.activePrefix = "";
+    // Migrate old single-counter cases (from earlier versions of this tool).
+    if(typeof d.counter === "number"){
+      var oldPrefix = normalizePrefix(d.prefix);
+      if(d.counters[oldPrefix] === undefined){
+        d.counters[oldPrefix] = d.counter;
+      }
+      d.activePrefix = oldPrefix;
+      delete d.counter;
+    }
+    if(d.counters[d.activePrefix] === undefined){
+      d.counters[d.activePrefix] = 0;
+    }
+  }
+
+  function nextNumber(d, prefix){
+    ensureCounters(d);
+    prefix = normalizePrefix(prefix);
+    var n = (d.counters[prefix] || 0) + 1;
+    d.counters[prefix] = n;
+    return { text: prefix ? (prefix + n) : String(n), prefix: prefix, seq: n };
+  }
+
   function todayStr(){ var d=new Date(); return d.getFullYear()+"-"+pad(d.getMonth()+1,2)+"-"+pad(d.getDate(),2); }
   function nowTimeStr(){ var d=new Date(); return pad(d.getHours(),2)+":"+pad(d.getMinutes(),2); }
   function fullTimeStr(){ var d=new Date(); return todayStr()+" "+nowTimeStr(); }
@@ -637,11 +671,13 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var n,r,i,a,
 
   function newCase(meta){
     var id = uid();
+    var initialPrefix = normalizePrefix(meta.prefix);
+    var counters = {};
+    counters[initialPrefix] = 0;
     var data = {
       meta: meta,
-      prefix: meta.prefix || "",
-      numberFormat: meta.numberFormat || "prefixPad",
-      counter: 0,
+      counters: counters,
+      activePrefix: initialPrefix,
       items: []
     };
     localStorage.setItem(LS_CASE_PREFIX+id, JSON.stringify(data));
@@ -655,6 +691,7 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var n,r,i,a,
   function openCase(id){
     var data = loadCaseData(id);
     if(!data) return false;
+    ensureCounters(data);
     state.caseId = id;
     state.data = data;
     localStorage.setItem(LS_ACTIVE, id);
@@ -671,18 +708,31 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var n,r,i,a,
   }
 
   // ---------- render ----------
+  function sortedItems(d){
+    return d.items.slice().sort(function(a, b){
+      var ap = a.prefix || "", bp = b.prefix || "";
+      if(ap !== bp) return ap < bp ? -1 : 1;
+      var as = (typeof a.seq === "number") ? a.seq : 0;
+      var bs = (typeof b.seq === "number") ? b.seq : 0;
+      return as - bs;
+    });
+  }
+
   function render(){
     var d = state.data;
     var grid = document.getElementById("grid");
     var empty = document.getElementById("emptyState");
     var title = document.getElementById("caseTitle");
     var line = document.getElementById("caseLine");
+    var prefixBar = document.getElementById("prefixBar");
+    var prefixBarLabel = document.getElementById("prefixBarLabel");
 
     if(!d){
       title.textContent = "證物紀錄";
       line.innerHTML = "";
       grid.innerHTML = "";
       empty.style.display = "block";
+      prefixBar.style.display = "none";
       return;
     }
     empty.style.display = d.items.length ? "none" : "block";
@@ -693,8 +743,11 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var n,r,i,a,
       (d.meta.date ? "<span>日期：<b>"+esc(d.meta.date)+"</b></span>" : "") +
       "<span>共 <b>"+d.items.length+"</b> 件</span>";
 
+    prefixBar.style.display = "flex";
+    prefixBarLabel.textContent = d.activePrefix ? (d.activePrefix + "1, " + d.activePrefix + "2…") : "1、2、3…";
+
     grid.innerHTML = "";
-    d.items.slice().reverse().forEach(function(item){
+    sortedItems(d).forEach(function(item){
       grid.appendChild(renderCard(item));
     });
   }
@@ -730,9 +783,12 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var n,r,i,a,
 
     var row1 = document.createElement("div");
     row1.className = "row1";
-    var tag = document.createElement("span");
+    var tag = document.createElement("button");
+    tag.type = "button";
     tag.className = "num-tag";
     tag.textContent = item.number;
+    tag.title = "點一下可修改編號";
+    tag.addEventListener("click", function(){ editItemNumber(item); });
     var time = document.createElement("span");
     time.className = "time";
     time.textContent = item.time;
@@ -799,10 +855,12 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var n,r,i,a,
 
   function createItemAndCapture(){
     var d = state.data;
-    d.counter += 1;
+    var numInfo = nextNumber(d, d.activePrefix);
     var item = {
       id: uid(),
-      number: makeNumber(d),
+      number: numInfo.text,
+      prefix: numInfo.prefix,
+      seq: numInfo.seq,
       photo: null,
       note: "",
       time: fullTimeStr()
@@ -871,6 +929,23 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var n,r,i,a,
     );
   }
 
+  function editItemNumber(item){
+    var html =
+      '<div class="field"><label>證物編號</label><input type="text" id="fEditNum" value="'+esc(item.number)+'"></div>' +
+      '<div class="hint">可以自由修改成任何文字，例如手寫調整順序或補上特殊標記。修改後的編號只影響顯示與排序，不影響其他證物的自動編號。</div>';
+    openModal("修改證物編號", html, [
+      {label:"取消", cls:"ghost"},
+      {label:"儲存", cls:"primary", action:function(sheet){
+        var val = sheet.querySelector("#fEditNum").value.trim();
+        if(!val){ toast("編號不能留空"); return false; }
+        item.number = val;
+        saveCaseData();
+        render();
+        toast("已更新編號");
+      }}
+    ], {center:true});
+  }
+
   // ---------- viewer ----------
   function openViewer(item){
     var v = document.createElement("div");
@@ -913,19 +988,16 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var n,r,i,a,
   }
 
   // ---------- case editor ----------
-  var NUMBER_FORMATS = [
-    {value:"prefixPad", label:"A-001、A-002…（字首＋三位數）"},
-    {value:"prefixNum", label:"A1、A2、A3…（字首＋流水號）"},
-    {value:"plain",     label:"1、2、3…（純數字，無字首）"}
-  ];
 
   function openCaseEditor(isNew){
     var d = state.data;
     var m = d ? d.meta : {};
-    var curFormat = d ? (d.numberFormat || "prefixPad") : "prefixPad";
-    var formatOptions = NUMBER_FORMATS.map(function(f){
-      return '<option value="'+f.value+'"'+(f.value===curFormat?" selected":"")+'>'+f.label+'</option>';
-    }).join("");
+
+    var prefixField = isNew
+      ? '<div class="field mono"><label>證物編號字首（可留空，或填 A–Z）</label>' +
+          '<input type="text" id="fPrefix" value="" placeholder="留空即可" maxlength="4" style="max-width:120px;"></div>' +
+        '<div class="hint">留空的話編號是 1、2、3…；填 A 的話是 A1、A2、A3…。建立案件後，現場還可以隨時再新增其他編號（例如 B1、B2…），不會互相影響。</div>'
+      : '';
 
     var html =
       '<div class="field"><label>案件編號 / 名稱</label><input type="text" id="fCaseNo" value="'+esc(m.caseNo||"")+'" placeholder="例：OOO竊盜案"></div>' +
@@ -939,13 +1011,7 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var n,r,i,a,
       '</div>' +
       '<div class="field"><label>記錄人</label><input type="text" id="fRecorder" value="'+esc(m.recorder||"")+'"></div>' +
       '<div class="field"><label>日期</label><input type="date" id="fDate" value="'+esc(m.date||todayStr())+'"></div>' +
-      '<div class="field mono"><label>證物編號字首（可留空，或填 A–Z）</label><input type="text" id="fPrefix" value="'+esc(d?d.prefix:"")+'" placeholder="留空即可" maxlength="4" style="max-width:120px;"></div>' +
-      '<div class="field"><label>證物編號格式</label>' +
-        '<select id="fNumFormat" style="width:100%;background:var(--bg-card);border:1px solid var(--line);color:var(--ink);border-radius:8px;padding:10px 11px;font-size:14.5px;">' +
-          formatOptions +
-        '</select>' +
-      '</div>' +
-      '<div class="hint">更改字首或格式不會影響已建立的編號，只影響之後新增的證物。</div>';
+      prefixField;
 
     var overlay = openModal(isNew ? "建立新案件" : "編輯案件資訊", html, [
       {label:"取消", cls:"ghost"},
@@ -954,11 +1020,11 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var n,r,i,a,
         var location = sheet.querySelector("#fLocation").value.trim();
         var recorder = sheet.querySelector("#fRecorder").value.trim();
         var date = sheet.querySelector("#fDate").value || todayStr();
-        var prefix = sheet.querySelector("#fPrefix").value.trim().toUpperCase();
-        var numberFormat = sheet.querySelector("#fNumFormat").value;
 
         if(isNew){
-          var id = newCase({caseNo:caseNo, location:location, recorder:recorder, date:date, prefix:prefix, numberFormat:numberFormat});
+          var prefixEl = sheet.querySelector("#fPrefix");
+          var prefix = prefixEl ? prefixEl.value.trim().toUpperCase() : "";
+          var id = newCase({caseNo:caseNo, location:location, recorder:recorder, date:date, prefix:prefix});
           openCase(id);
           createItemAndCapture();
         } else {
@@ -966,8 +1032,6 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var n,r,i,a,
           d.meta.location = location;
           d.meta.recorder = recorder;
           d.meta.date = date;
-          d.prefix = prefix;
-          d.numberFormat = numberFormat;
           saveCaseData();
           render();
           toast("已更新案件資訊");
@@ -1005,6 +1069,57 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var n,r,i,a,
     openCaseEditor(!state.caseId);
   });
 
+  // ---------- switch / add numbering group (prefix) within the same case ----------
+  function openPrefixSwitcher(){
+    var d = state.data;
+    if(!d) return;
+    ensureCounters(d);
+    var groups = Object.keys(d.counters);
+    // Always make sure "no prefix" is offered as an option.
+    if(groups.indexOf("") === -1) groups.unshift("");
+    groups.sort(function(a,b){ return a < b ? -1 : (a > b ? 1 : 0); });
+
+    var html = '<div style="display:flex; flex-direction:column; gap:8px; margin-bottom:14px;">' +
+      groups.map(function(g){
+        var label = g ? (g + "1, " + g + "2…") : "1、2、3…（無字首）";
+        var isActive = (g === d.activePrefix);
+        return '<button type="button" class="prefixChoice" data-prefix="'+esc(g)+'" style="' +
+          'text-align:left; padding:12px 14px; border-radius:9px; font-size:14px; font-family:var(--sans); ' +
+          'border:1px solid '+(isActive?'var(--tag)':'var(--line)')+'; ' +
+          'background:'+(isActive?'rgba(232,163,61,0.12)':'var(--bg-card))')+'; color:var(--ink);">' +
+          label + (isActive ? '　目前使用中' : '') +
+          '</button>';
+      }).join('') +
+      '</div>' +
+      '<div class="field mono"><label>新增一個字首（A–Z，留空表示「無字首」那組）</label>' +
+        '<input type="text" id="fNewPrefix" maxlength="4" placeholder="例如 B" style="max-width:140px;">' +
+      '</div>';
+
+    var overlay = openModal("切換／新增編號", html, [
+      {label:"關閉", cls:"ghost"},
+      {label:"新增並切換", cls:"primary", action:function(sheet){
+        var np = normalizePrefix(sheet.querySelector("#fNewPrefix").value);
+        ensureCounters(d);
+        if(d.counters[np] === undefined) d.counters[np] = 0;
+        d.activePrefix = np;
+        saveCaseData();
+        render();
+        toast(np ? ("已切換到 "+np+" 編號") : "已切換到無字首編號");
+      }}
+    ], {center:true});
+
+    overlay.querySelectorAll(".prefixChoice").forEach(function(btn){
+      btn.addEventListener("click", function(){
+        d.activePrefix = btn.getAttribute("data-prefix");
+        saveCaseData();
+        render();
+        overlay.remove();
+        toast(d.activePrefix ? ("已切換到 "+d.activePrefix+" 編號") : "已切換到無字首編號");
+      });
+    });
+  }
+  document.getElementById("btnSwitchPrefix").addEventListener("click", openPrefixSwitcher);
+
   // ---------- case switcher ----------
   function openCaseSwitcher(){
     var list = getCaseList();
@@ -1016,7 +1131,10 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var n,r,i,a,
         return '<div class="caselist-item" data-id="'+c.id+'">' +
           '<div class="info"><b>'+esc(c.caseNo||"未命名案件")+'</b>' +
           '<span>'+esc(c.location||"")+(c.location?" ・ ":"")+(c.count||0)+' 件</span></div>' +
-          '<button class="openBtn" data-id="'+c.id+'">開啟</button>' +
+          '<div style="display:flex; gap:8px;">' +
+            '<button class="openBtn" data-id="'+c.id+'">開啟</button>' +
+            '<button class="delBtn" data-id="'+c.id+'" style="color:var(--danger); border-color:var(--danger);">刪除</button>' +
+          '</div>' +
           '</div>';
       }).join('') + '</div>';
     }
@@ -1028,6 +1146,35 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var n,r,i,a,
       btn.addEventListener("click", function(){
         openCase(btn.getAttribute("data-id"));
         overlay.remove();
+      });
+    });
+    overlay.querySelectorAll(".delBtn").forEach(function(btn){
+      btn.addEventListener("click", function(){
+        var id = btn.getAttribute("data-id");
+        var list2 = getCaseList();
+        var entry = list2.find(function(c){ return c.id === id; });
+        overlay.remove();
+        openModal(
+          "刪除這個案件？",
+          '<div class="hint" style="margin-bottom:16px;">「'+esc(entry?entry.caseNo:"")+'」以及裡面所有證物照片都會被永久刪除，此動作無法復原。建議刪除前先「匯出備份」保存一份。</div>',
+          [
+            {label:"取消", cls:"ghost"},
+            {label:"刪除", cls:"danger", action:function(){
+              localStorage.removeItem(LS_CASE_PREFIX + id);
+              var list3 = getCaseList().filter(function(c){ return c.id !== id; });
+              saveCaseList(list3);
+              if(state.caseId === id){
+                state.caseId = null;
+                state.data = null;
+                localStorage.removeItem(LS_ACTIVE);
+                if(list3.length){ openCase(list3[0].id); }
+                else { render(); }
+              }
+              toast("已刪除案件");
+            }}
+          ],
+          {center:true}
+        );
       });
     });
   }
