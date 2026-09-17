@@ -1,0 +1,15 @@
+{
+  "name": "證物紀錄",
+  "short_name": "證物紀錄",
+  "description": "刑案現場證物編號與拍照記錄工具",
+  "start_url": "./index.html",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#14161a",
+  "theme_color": "#14161a",
+  "icons": [
+    { "src": "icon-180.png", "sizes": "180x180", "type": "image/png" },
+    { "src": "icon-512.png", "sizes": "512x512", "type": "image/png" }
+  ]
+}
