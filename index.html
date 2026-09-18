@@ -722,6 +722,193 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var n,r,i,a,
   function nowTimeStr(){ var d=new Date(); return pad(d.getHours(),2)+":"+pad(d.getMinutes(),2); }
   function fullTimeStr(){ var d=new Date(); return todayStr()+" "+nowTimeStr(); }
 
+  // ---------- OPFS (Origin Private File System) photo storage ----------
+  // Photos are stored as actual files in OPFS (far larger quota than
+  // localStorage, typically hundreds of MB or more, tied to device storage)
+  // instead of being embedded as base64 text inside the JSON we keep in
+  // localStorage. Each item/section entry stores only a short reference
+  // string; localStorage stays small (just text), which is what actually
+  // has the ~5MB ceiling.
+  //
+  // Reference formats used throughout the app:
+  //   "opfs:<filename>"  -> photo lives in OPFS, filename is a plain string
+  //   "data:image/..."   -> legacy inline photo (from before this feature,
+  //                          or a fallback if OPFS is unavailable/fails)
+  var opfsRoot = null;
+  var opfsAvailable = false;
+
+  var opfsReadyPromise = (function(){
+    try{
+      if(navigator.storage && navigator.storage.getDirectory){
+        return navigator.storage.getDirectory().then(function(root){
+          opfsRoot = root;
+          opfsAvailable = true;
+        }).catch(function(){ opfsAvailable = false; });
+      }
+    }catch(e){}
+    return Promise.resolve();
+  })();
+
+  function opfsWriteBlob(filename, blob){
+    return opfsRoot.getFileHandle(filename, {create:true}).then(function(handle){
+      return handle.createWritable();
+    }).then(function(writable){
+      return writable.write(blob).then(function(){ return writable.close(); });
+    });
+  }
+
+  function opfsReadBlob(filename){
+    return opfsRoot.getFileHandle(filename).then(function(handle){
+      return handle.getFile();
+    });
+  }
+
+  function opfsDelete(filename){
+    if(!opfsAvailable || !opfsRoot) return Promise.resolve();
+    return opfsRoot.removeEntry(filename).catch(function(){});
+  }
+
+  function opfsDeleteByPrefix(prefix){
+    if(!opfsAvailable || !opfsRoot || !opfsRoot.keys) return Promise.resolve();
+    var names = [];
+    return (async function(){
+      try{
+        for await (var name of opfsRoot.keys()){
+          if(name.indexOf(prefix) === 0) names.push(name);
+        }
+      }catch(e){ return; }
+      for(var i=0;i<names.length;i++){
+        try{ await opfsRoot.removeEntry(names[i]); }catch(e){}
+      }
+    })();
+  }
+
+  function blobToDataUrl(blob){
+    return new Promise(function(resolve){
+      var r = new FileReader();
+      r.onload = function(){ resolve(r.result); };
+      r.onerror = function(){ resolve(null); };
+      r.readAsDataURL(blob);
+    });
+  }
+
+  function dataUrlToBlob(dataUrl){
+    var parts = dataUrl.split(",");
+    var mimeMatch = parts[0].match(/:(.*?);/);
+    var mime = mimeMatch ? mimeMatch[1] : "image/jpeg";
+    var bin = atob(parts[1]);
+    var arr = new Uint8Array(bin.length);
+    for(var i=0;i<bin.length;i++){ arr[i] = bin.charCodeAt(i); }
+    return new Blob([arr], {type:mime});
+  }
+
+  // Stores a captured photo (Blob) and returns a Promise resolving to the
+  // reference string to save on the item/entry. Prefers OPFS; if it's
+  // unavailable or the write fails for any reason, falls back to an inline
+  // base64 data URL (the old behaviour) so photos are never silently lost.
+  function storePhotoBlob(blob){
+    return opfsReadyPromise.then(function(){
+      if(!opfsAvailable){ return blobToDataUrl(blob); }
+      var filename = "p_" + (state.caseId || "nocase") + "_" + uid() + ".jpg";
+      return opfsWriteBlob(filename, blob).then(function(){
+        return "opfs:" + filename;
+      }).catch(function(){
+        return blobToDataUrl(blob);
+      });
+    });
+  }
+
+  // Deletes the OPFS file behind a reference, if any (no-op for inline/legacy refs).
+  function releasePhotoRef(ref){
+    if(!ref || ref.indexOf("opfs:") !== 0) return;
+    var filename = ref.slice(5);
+    if(blobUrlCache[filename]){
+      URL.revokeObjectURL(blobUrlCache[filename]);
+      delete blobUrlCache[filename];
+    }
+    opfsDelete(filename);
+  }
+
+  // In-memory cache of filename -> object URL, so we don't re-read the same
+  // file from disk on every re-render. resolvePhotoSrc() is the one thing
+  // renderCard/renderSectionCard call to get something they can put in
+  // <img src>; it returns null (and kicks off a background load) if the
+  // photo isn't ready in the cache yet, since OPFS reads are async but our
+  // render() function is not.
+  var blobUrlCache = {};
+  var blobLoadInFlight = {};
+  var rerenderScheduled = false;
+
+  function scheduleRerender(){
+    if(rerenderScheduled) return;
+    rerenderScheduled = true;
+    setTimeout(function(){ rerenderScheduled = false; render(); }, 30);
+  }
+
+  function resolvePhotoSrc(ref){
+    if(!ref) return null;
+    if(ref.indexOf("data:") === 0) return ref; // legacy inline photo
+    if(ref.indexOf("opfs:") === 0){
+      var filename = ref.slice(5);
+      if(blobUrlCache[filename]) return blobUrlCache[filename];
+      if(!blobLoadInFlight[filename]){
+        blobLoadInFlight[filename] = true;
+        opfsReadyPromise.then(function(){
+          return opfsReadBlob(filename);
+        }).then(function(file){
+          blobUrlCache[filename] = URL.createObjectURL(file);
+          delete blobLoadInFlight[filename];
+          scheduleRerender();
+        }).catch(function(){
+          delete blobLoadInFlight[filename];
+        });
+      }
+      return null; // not loaded yet; caller shows a loading placeholder
+    }
+    return null;
+  }
+
+  // Builds a deep clone of a case with every "opfs:" reference replaced by
+  // an actual base64 data URL — used right before export/PDF, since those
+  // need real image data rather than a pointer into OPFS.
+  function materializeCaseForExport(d){
+    var clone = JSON.parse(JSON.stringify(d));
+    var tasks = [];
+
+    (clone.items || []).forEach(function(item){
+      if(!item.shots) return;
+      SHOT_TYPES.forEach(function(st){
+        var ref = item.shots[st.key];
+        if(ref && ref.indexOf("opfs:") === 0){
+          var filename = ref.slice(5);
+          tasks.push(
+            opfsReadBlob(filename).then(blobToDataUrl).then(function(dataUrl){
+              item.shots[st.key] = dataUrl;
+            }).catch(function(){ item.shots[st.key] = null; })
+          );
+        }
+      });
+    });
+
+    SECTIONS.forEach(function(s){
+      var list = clone.sections && clone.sections[s.key];
+      if(!list) return;
+      list.forEach(function(entry){
+        var ref = entry.photo;
+        if(ref && ref.indexOf("opfs:") === 0){
+          var filename = ref.slice(5);
+          tasks.push(
+            opfsReadBlob(filename).then(blobToDataUrl).then(function(dataUrl){
+              entry.photo = dataUrl;
+            }).catch(function(){ entry.photo = null; })
+          );
+        }
+      });
+    });
+
+    return Promise.all(tasks).then(function(){ return clone; });
+  }
+
   function getCaseList(){
     try{ return JSON.parse(localStorage.getItem(LS_CASE_LIST) || "[]"); }catch(e){ return []; }
   }
@@ -731,8 +918,13 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var n,r,i,a,
     try{ return JSON.parse(localStorage.getItem(LS_CASE_PREFIX+id)); }catch(e){ return null; }
   }
   function saveCaseData(){
-    if(!state.caseId || !state.data) return;
-    localStorage.setItem(LS_CASE_PREFIX+state.caseId, JSON.stringify(state.data));
+    if(!state.caseId || !state.data) return true;
+    try{
+      localStorage.setItem(LS_CASE_PREFIX+state.caseId, JSON.stringify(state.data));
+    }catch(e){
+      showStorageFullWarning();
+      return false;
+    }
     var list = getCaseList();
     var entry = list.find(function(c){ return c.id===state.caseId; });
     if(entry){
@@ -741,6 +933,28 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var n,r,i,a,
       entry.count = state.data.items.length;
       saveCaseList(list);
     }
+    return true;
+  }
+
+  var storageWarningShown = false;
+  function showStorageFullWarning(){
+    // Avoid stacking multiple copies of this modal if several saves fail in a row.
+    if(storageWarningShown) return;
+    storageWarningShown = true;
+    var html =
+      '<div class="hint" style="margin-bottom:14px; color:var(--ink);">' +
+      '這支手機瀏覽器的儲存空間已經滿了，剛剛那張照片<b style="color:var(--danger);">沒有存進去</b>。' +
+      '這通常在同一個案件累積了不少高解析度照片後發生（iOS Safari 每個網站大約只有 5MB 左右可用）。' +
+      '</div>' +
+      '<div class="hint" style="margin-bottom:6px;">建議現在：</div>' +
+      '<div class="hint" style="margin-bottom:14px;">' +
+      '1. 立刻點「匯出備份」把目前的資料複製保存起來<br>' +
+      '2. 到「切換案件」刪除不再需要的舊案件釋放空間<br>' +
+      '3. 回來後可以繼續拍，剛剛沒存進去的那張需要重拍一次' +
+      '</div>';
+    openModal("儲存空間已滿", html, [
+      {label:"我知道了", cls:"primary", action:function(){ storageWarningShown = false; }}
+    ], {center:true, noOutsideClose:true});
   }
 
   function newCase(meta){
@@ -874,21 +1088,32 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var n,r,i,a,
     SHOT_TYPES.forEach(function(st){
       var cell = document.createElement("div");
       cell.className = "shotcell";
-      var photo = shots[st.key];
-      if(photo){
-        var img = document.createElement("img");
-        img.src = photo;
-        cell.appendChild(img);
-        var lbl = document.createElement("span");
-        lbl.className = "shotlabel";
-        lbl.textContent = st.label;
-        cell.appendChild(lbl);
-        cell.addEventListener("click", function(){
-          openViewer(photo, item.number + "・" + st.label,
-            function(){ addPhotoToItemShot(item, st.key); },
-            function(){ shots[st.key] = null; saveCaseData(); render(); }
-          );
-        });
+      var ref = shots[st.key];
+      if(ref){
+        var src = resolvePhotoSrc(ref);
+        if(src){
+          var img = document.createElement("img");
+          img.src = src;
+          cell.appendChild(img);
+          var lbl = document.createElement("span");
+          lbl.className = "shotlabel";
+          lbl.textContent = st.label;
+          cell.appendChild(lbl);
+          cell.addEventListener("click", function(){
+            openViewer(src, item.number + "・" + st.label,
+              function(){ addPhotoToItemShot(item, st.key); },
+              function(){
+                releasePhotoRef(shots[st.key]);
+                shots[st.key] = null;
+                saveCaseData();
+                render();
+              }
+            );
+          });
+        } else {
+          cell.classList.add("empty");
+          cell.textContent = "載入中…";
+        }
       } else {
         cell.classList.add("empty");
         cell.textContent = "＋ " + st.label;
@@ -948,22 +1173,30 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var n,r,i,a,
 
     var thumb = document.createElement("div");
     thumb.className = "thumb";
-    if(entry.photo){
+    var src = entry.photo ? resolvePhotoSrc(entry.photo) : null;
+    if(entry.photo && src){
       var img = document.createElement("img");
-      img.src = entry.photo;
+      img.src = src;
       thumb.appendChild(img);
       thumb.addEventListener("click", function(){
-        openViewer(entry.photo, sectionLabel(sectionKey),
+        openViewer(src, sectionLabel(sectionKey),
           function(){ retakeSectionPhoto(entry); },
-          function(){ entry.photo = null; saveCaseData(); render(); }
+          function(){
+            releasePhotoRef(entry.photo);
+            entry.photo = null;
+            saveCaseData();
+            render();
+          }
         );
       });
     } else {
       var ni = document.createElement("div");
       ni.className = "noimg";
-      ni.textContent = "無照片\n點右側拍照";
+      ni.textContent = entry.photo ? "載入中…" : "無照片\n點右側拍照";
       thumb.appendChild(ni);
-      thumb.addEventListener("click", function(){ retakeSectionPhoto(entry); });
+      if(!entry.photo){
+        thumb.addEventListener("click", function(){ retakeSectionPhoto(entry); });
+      }
     }
     card.appendChild(thumb);
 
@@ -1032,8 +1265,9 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var n,r,i,a,
 
   // ---------- add / photo ----------
   // A single generalized capture pipeline: whoever wants a photo calls
-  // capturePhoto(callback) and gets the compressed data URL back, regardless
+  // capturePhoto(callback) and gets a compressed JPEG Blob back, regardless
   // of whether it's going into an evidence shot slot or a section entry.
+  // The callback is responsible for storing it (storePhotoBlob) and saving.
   var pendingPhotoCallback = null;
 
   function capturePhoto(onDone){
@@ -1072,11 +1306,19 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var n,r,i,a,
   }
 
   function addPhotoToItemShot(item, shotKey){
-    capturePhoto(function(dataUrl){
-      ensureShots(item)[shotKey] = dataUrl;
-      saveCaseData();
-      render();
-      toast("已存入 " + item.number + "・" + shotLabel(shotKey));
+    capturePhoto(function(blob){
+      var shots = ensureShots(item);
+      var oldRef = shots[shotKey];
+      toast("儲存中…");
+      storePhotoBlob(blob).then(function(ref){
+        shots[shotKey] = ref;
+        var ok = saveCaseData();
+        render();
+        if(ok){
+          toast("已存入 " + item.number + "・" + shotLabel(shotKey));
+          releasePhotoRef(oldRef); // only release the old file once the new one is safely saved
+        }
+      });
     });
   }
 
@@ -1087,19 +1329,27 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var n,r,i,a,
     d.sections[sectionKey].push(entry);
     saveCaseData();
     render();
-    capturePhoto(function(dataUrl){
-      entry.photo = dataUrl;
-      saveCaseData();
-      render();
-      toast("已新增「" + sectionLabel(sectionKey) + "」照片");
+    capturePhoto(function(blob){
+      toast("儲存中…");
+      storePhotoBlob(blob).then(function(ref){
+        entry.photo = ref;
+        var ok = saveCaseData();
+        render();
+        if(ok) toast("已新增「" + sectionLabel(sectionKey) + "」照片");
+      });
     });
   }
 
   function retakeSectionPhoto(entry){
-    capturePhoto(function(dataUrl){
-      entry.photo = dataUrl;
-      saveCaseData();
-      render();
+    capturePhoto(function(blob){
+      var oldRef = entry.photo;
+      toast("儲存中…");
+      storePhotoBlob(blob).then(function(ref){
+        entry.photo = ref;
+        var ok = saveCaseData();
+        render();
+        if(ok) releasePhotoRef(oldRef);
+      });
     });
   }
 
@@ -1112,22 +1362,54 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var n,r,i,a,
     compressImage(file, cb);
   });
 
+  // Compresses to roughly 4x6" print quality (long edge ~1600px, which is
+  // about 266 DPI at 6 inches — plenty for both on-screen review and a
+  // printed report) and hands back a JPEG Blob ready for OPFS storage.
   function compressImage(file, cb){
     var reader = new FileReader();
     reader.onload = function(ev){
       var img = new Image();
       img.onload = function(){
-        var maxW = 1280;
-        var scale = Math.min(1, maxW / img.width);
-        var w = Math.round(img.width * scale);
-        var h = Math.round(img.height * scale);
+        var srcW = img.width, srcH = img.height;
+
+        // Center-crop to a 4x6 print ratio (2:3), matching whichever
+        // orientation the photo was actually taken in.
+        var isPortrait = srcH >= srcW;
+        var targetRatio = isPortrait ? (4 / 6) : (6 / 4); // width / height
+        var srcRatio = srcW / srcH;
+        var cropX, cropY, cropW, cropH;
+        if(srcRatio > targetRatio){
+          // source is relatively wider than 4x6 -> trim left/right
+          cropH = srcH;
+          cropW = Math.round(srcH * targetRatio);
+          cropX = Math.round((srcW - cropW) / 2);
+          cropY = 0;
+        } else {
+          // source is relatively taller than 4x6 -> trim top/bottom
+          cropW = srcW;
+          cropH = Math.round(srcW / targetRatio);
+          cropX = 0;
+          cropY = Math.round((srcH - cropH) / 2);
+        }
+
+        var maxDim = 1600; // long edge, ~266 DPI at 6" — good print quality
+        var scale = Math.min(1, maxDim / Math.max(cropW, cropH));
+        var outW = Math.round(cropW * scale);
+        var outH = Math.round(cropH * scale);
+
         var canvas = document.createElement("canvas");
-        canvas.width = w; canvas.height = h;
+        canvas.width = outW; canvas.height = outH;
         var ctx = canvas.getContext("2d");
-        ctx.drawImage(img, 0, 0, w, h);
-        cb(canvas.toDataURL("image/jpeg", 0.82));
+        ctx.drawImage(img, cropX, cropY, cropW, cropH, 0, 0, outW, outH);
+        if(canvas.toBlob){
+          canvas.toBlob(function(blob){
+            cb(blob || dataUrlToBlob(canvas.toDataURL("image/jpeg", 0.85)));
+          }, "image/jpeg", 0.85);
+        } else {
+          cb(dataUrlToBlob(canvas.toDataURL("image/jpeg", 0.85)));
+        }
       };
-      img.onerror = function(){ cb(ev.target.result); };
+      img.onerror = function(){ cb(dataUrlToBlob(ev.target.result)); };
       img.src = ev.target.result;
     };
     reader.readAsDataURL(file);
@@ -1141,6 +1423,8 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var n,r,i,a,
         {label:"取消", cls:"ghost"},
         {label:"刪除", cls:"danger", action:function(){
           var d = state.data;
+          var shots = ensureShots(item);
+          SHOT_TYPES.forEach(function(st){ releasePhotoRef(shots[st.key]); });
           d.items = d.items.filter(function(i){ return i.id !== item.id; });
           saveCaseData();
           render();
@@ -1159,6 +1443,7 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var n,r,i,a,
         {label:"刪除", cls:"danger", action:function(){
           var d = state.data;
           ensureSections(d);
+          releasePhotoRef(entry.photo);
           d.sections[sectionKey] = d.sections[sectionKey].filter(function(e){ return e.id !== entry.id; });
           saveCaseData();
           render();
@@ -1409,6 +1694,7 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var n,r,i,a,
             {label:"取消", cls:"ghost"},
             {label:"刪除", cls:"danger", action:function(){
               localStorage.removeItem(LS_CASE_PREFIX + id);
+              opfsDeleteByPrefix("p_" + id + "_");
               var list3 = getCaseList().filter(function(c){ return c.id !== id; });
               saveCaseList(list3);
               if(state.caseId === id){
@@ -1452,18 +1738,21 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var n,r,i,a,
   // ---------- export / import (clipboard based, works without file downloads) ----------
   document.getElementById("btnExport").addEventListener("click", function(){
     if(!state.data){ toast("尚無案件可匯出"); return; }
-    var payload = JSON.stringify(state.data);
-    var html =
-      '<div class="hint" style="margin-bottom:10px;">這是這個案件的完整備份文字。點「複製到剪貼簿」後，貼到備忘錄、LINE、Email 或任何筆記 App 存起來即可，之後可用同一段文字在「匯入備份」還原。</div>' +
-      textareaHtml("exportText", payload);
-    openModal("匯出備份文字", html, [
-      {label:"關閉", cls:"ghost"},
-      {label:"複製到剪貼簿", cls:"primary", action:function(sheet){
-        var ok = copyTextareaContent(sheet.querySelector("#exportText"));
-        toast(ok ? "已複製，貼到備忘錄等App保存" : "自動複製失敗，請長按文字框選取後手動複製");
-        return false; // keep the sheet open in case they need to retry / copy manually
-      }}
-    ], {center:true});
+    toast("正在準備照片，請稍候…");
+    materializeCaseForExport(state.data).then(function(clone){
+      var payload = JSON.stringify(clone);
+      var html =
+        '<div class="hint" style="margin-bottom:10px;">這是這個案件的完整備份文字（含所有照片）。點「複製到剪貼簿」後，貼到備忘錄、LINE、Email 或任何筆記 App 存起來即可，之後可用同一段文字在「匯入備份」還原。</div>' +
+        textareaHtml("exportText", payload);
+      openModal("匯出備份文字", html, [
+        {label:"關閉", cls:"ghost"},
+        {label:"複製到剪貼簿", cls:"primary", action:function(sheet){
+          var ok = copyTextareaContent(sheet.querySelector("#exportText"));
+          toast(ok ? "已複製，貼到備忘錄等App保存" : "自動複製失敗，請長按文字框選取後手動複製");
+          return false; // keep the sheet open in case they need to retry / copy manually
+        }}
+      ], {center:true});
+    });
   });
 
   document.getElementById("btnImport").addEventListener("click", function(){
@@ -1584,8 +1873,7 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var n,r,i,a,
     return chain;
   }
 
-  function buildPdf(){
-    var d = state.data;
+  function buildPdf(d){
     ensureSections(d);
     var JsPDF = window.jspdf && window.jspdf.jsPDF;
     if(!JsPDF) return Promise.reject(new Error("jsPDF not available"));
@@ -1718,10 +2006,14 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var n,r,i,a,
     ensureSections(state.data);
     var hasSectionPhotos = SECTIONS.some(function(s){ return (state.data.sections[s.key]||[]).length > 0; });
     if(!state.data.items.length && !hasSectionPhotos){ toast("尚無任何照片可匯出"); return; }
-    toast("正在製作 PDF…");
-    buildPdf().then(function(doc){
+    var caseNoForFile = state.data.meta.caseNo;
+    toast("正在準備照片…");
+    materializeCaseForExport(state.data).then(function(clone){
+      toast("正在製作 PDF…");
+      return buildPdf(clone);
+    }).then(function(doc){
       var blob = doc.output("blob");
-      var safe = (state.data.meta.caseNo || "case").replace(/[\\\/:*?"<>|]+/g, "_");
+      var safe = (caseNoForFile || "case").replace(/[\\\/:*?"<>|]+/g, "_");
       var filename = "證物清單_" + safe + "_" + todayStr() + ".pdf";
       return deliverPdfBlob(blob, filename);
     }).then(function(method){
