@@ -226,6 +226,7 @@
     <button id="btnExport">匯出備份</button>
     <button id="btnImport">匯入備份</button>
     <button id="btnPrint">列印 / PDF</button>
+    <button id="btnStorage">儲存空間</button>
   </div>
 
   <div class="tabbar" id="tabBar" style="display:none;">
@@ -1474,18 +1475,50 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var n,r,i,a,
   function openViewer(dataUrl, label, onRetake, onDelete){
     var v = document.createElement("div");
     v.className = "viewer";
-    v.innerHTML =
-      '<img src="'+dataUrl+'">' +
-      '<div class="vbar">' +
-        '<span class="vnum">'+esc(label)+'</span>' +
-        '<div style="display:flex; gap:8px;">' +
-          (onRetake ? '<button id="vRetake">重拍</button>' : '') +
-          (onDelete ? '<button id="vDelete" style="color:var(--danger); border-color:var(--danger);">刪除</button>' : '') +
-          '<button id="vClose">關閉</button>' +
-        '</div>' +
-      '</div>';
+
+    // Built via DOM APIs rather than innerHTML string-concatenation: dataUrl
+    // can originate from an imported backup file, which is untrusted input,
+    // so it must never be parsed as HTML markup. Setting .src as a property
+    // is safe regardless of its content — the browser treats it purely as a
+    // URL string, never as markup, even if it contains quote/angle-bracket
+    // characters.
+    var img = document.createElement("img");
+    img.src = dataUrl;
+    v.appendChild(img);
+
+    var bar = document.createElement("div");
+    bar.className = "vbar";
+    var vnum = document.createElement("span");
+    vnum.className = "vnum";
+    vnum.textContent = label;
+    bar.appendChild(vnum);
+
+    var btnRow = document.createElement("div");
+    btnRow.style.display = "flex";
+    btnRow.style.gap = "8px";
+    if(onRetake){
+      var retakeBtn = document.createElement("button");
+      retakeBtn.id = "vRetake";
+      retakeBtn.textContent = "重拍";
+      btnRow.appendChild(retakeBtn);
+    }
+    if(onDelete){
+      var deleteBtn = document.createElement("button");
+      deleteBtn.id = "vDelete";
+      deleteBtn.style.color = "var(--danger)";
+      deleteBtn.style.borderColor = "var(--danger)";
+      deleteBtn.textContent = "刪除";
+      btnRow.appendChild(deleteBtn);
+    }
+    var closeBtn = document.createElement("button");
+    closeBtn.id = "vClose";
+    closeBtn.textContent = "關閉";
+    btnRow.appendChild(closeBtn);
+    bar.appendChild(btnRow);
+    v.appendChild(bar);
+
     document.body.appendChild(v);
-    v.querySelector("#vClose").addEventListener("click", function(){ v.remove(); });
+    closeBtn.addEventListener("click", function(){ v.remove(); });
     if(onRetake){ v.querySelector("#vRetake").addEventListener("click", function(){ v.remove(); onRetake(); }); }
     if(onDelete){ v.querySelector("#vDelete").addEventListener("click", function(){ v.remove(); onDelete(); }); }
     v.addEventListener("click", function(e){ if(e.target===v) v.remove(); });
@@ -1714,6 +1747,105 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var n,r,i,a,
   }
   document.getElementById("btnCases").addEventListener("click", openCaseSwitcher);
 
+  // ---------- storage diagnostics ----------
+  // Helps answer "why is it full" concretely instead of guessing: shows
+  // whether OPFS actually kicked in on this device, how much localStorage
+  // text is used (this is what has the ~5MB ceiling), and a per-case
+  // breakdown so an old/forgotten test case eating up space is easy to spot
+  // and clear.
+  function estimateLocalStorageBytes(){
+    var total = 0;
+    try{
+      for(var i=0;i<localStorage.length;i++){
+        var k = localStorage.key(i);
+        var v = localStorage.getItem(k) || "";
+        total += k.length + v.length;
+      }
+    }catch(e){}
+    return total; // characters ≈ bytes for our mostly-ASCII/base64 JSON content
+  }
+
+  function formatBytes(n){
+    if(n < 1024) return n + " B";
+    if(n < 1024*1024) return (n/1024).toFixed(1) + " KB";
+    return (n/1024/1024).toFixed(2) + " MB";
+  }
+
+  function openStorageDiagnostics(){
+    var list = getCaseList();
+    var rows = list.map(function(c){
+      var raw = localStorage.getItem(LS_CASE_PREFIX + c.id) || "";
+      return { id: c.id, caseNo: c.caseNo || "未命名案件", bytes: raw.length };
+    }).sort(function(a, b){ return b.bytes - a.bytes; });
+
+    var totalLs = estimateLocalStorageBytes();
+
+    var body =
+      '<div class="hint" style="margin-bottom:10px;">' +
+      '照片儲存方式：<b style="color:'+(opfsAvailable ? "var(--ok)" : "var(--danger)")+';">' +
+      (opfsAvailable ? "OPFS（大容量，新照片會存這裡）" : "⚠️ 瀏覽器內建空間（容量有限，約 5MB）") +
+      '</b></div>' +
+      '<div class="hint" style="margin-bottom:14px;">文字資料（案件資訊、備份索引等）用量：<b>'+formatBytes(totalLs)+'</b>' +
+      (totalLs > 3.5*1024*1024 ? '　<span style="color:var(--danger);">已接近上限</span>' : '') +
+      '</div>';
+
+    if(!rows.length){
+      body += '<div class="hint">目前沒有任何案件。</div>';
+    } else {
+      body += '<div class="hint" style="margin-bottom:8px;">各案件佔用的文字資料大小（由大到小；舊版本拍的照片若還沒搬到 OPFS，會佔用比較多空間，可以考慮刪除或匯出後刪除）：</div>';
+      rows.forEach(function(r){
+        body +=
+          '<div class="caselist-item">' +
+            '<div class="info"><b>'+esc(r.caseNo)+'</b><span>'+formatBytes(r.bytes)+'</span></div>' +
+            '<div style="display:flex; gap:8px;">' +
+              '<button class="diagOpenBtn" data-id="'+r.id+'">開啟</button>' +
+              '<button class="diagDelBtn" data-id="'+r.id+'" style="color:var(--danger); border-color:var(--danger);">刪除</button>' +
+            '</div>' +
+          '</div>';
+      });
+    }
+
+    var overlay = openModal("儲存空間", body, [
+      {label:"關閉", cls:"ghost"}
+    ], {center:true});
+
+    overlay.querySelectorAll(".diagOpenBtn").forEach(function(btn){
+      btn.addEventListener("click", function(){
+        openCase(btn.getAttribute("data-id"));
+        overlay.remove();
+      });
+    });
+    overlay.querySelectorAll(".diagDelBtn").forEach(function(btn){
+      btn.addEventListener("click", function(){
+        var id = btn.getAttribute("data-id");
+        overlay.remove();
+        openModal(
+          "刪除這個案件？",
+          '<div class="hint" style="margin-bottom:16px;">會釋放它佔用的儲存空間，此動作無法復原。建議刪除前先「匯出備份」保存一份。</div>',
+          [
+            {label:"取消", cls:"ghost"},
+            {label:"刪除", cls:"danger", action:function(){
+              localStorage.removeItem(LS_CASE_PREFIX + id);
+              opfsDeleteByPrefix("p_" + id + "_");
+              var list3 = getCaseList().filter(function(c){ return c.id !== id; });
+              saveCaseList(list3);
+              if(state.caseId === id){
+                state.caseId = null;
+                state.data = null;
+                localStorage.removeItem(LS_ACTIVE);
+                if(list3.length){ openCase(list3[0].id); } else { render(); }
+              }
+              toast("已刪除案件");
+            }}
+          ],
+          {center:true}
+        );
+      });
+    });
+  }
+  document.getElementById("btnStorage").addEventListener("click", openStorageDiagnostics);
+
+
   // ---------- clipboard helper ----------
   // Works even on file:// / embedded in-app browsers where navigator.clipboard
   // is unavailable (it requires a secure context). Falls back to the classic
@@ -1755,6 +1887,59 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var n,r,i,a,
     });
   });
 
+  // Defense in depth for the import feature: the rendering paths (img.src as
+  // a DOM property, textContent for labels) are already safe against markup
+  // injection regardless of content, but a pasted backup is still untrusted
+  // input in general, so we don't trust its shape blindly either — coerce
+  // every field to the type we expect and drop any photo reference that
+  // isn't a recognized, well-formed format.
+  function isSafePhotoRef(ref){
+    if(ref === null || ref === undefined) return true;
+    if(typeof ref !== "string") return false;
+    if(ref.indexOf("data:image/") === 0) return true;
+    if(ref.indexOf("opfs:") === 0) return true;
+    return false;
+  }
+
+  function sanitizeImportedCase(data){
+    function str(v){ return (typeof v === "string") ? v : ""; }
+
+    data.meta = (data.meta && typeof data.meta === "object") ? data.meta : {};
+    data.meta.caseNo = str(data.meta.caseNo);
+    data.meta.location = str(data.meta.location);
+    data.meta.recorder = str(data.meta.recorder);
+    data.meta.date = str(data.meta.date);
+
+    if(!Array.isArray(data.items)) data.items = [];
+    data.items.forEach(function(item){
+      item.number = str(item.number) || "?";
+      item.note = str(item.note);
+      item.time = str(item.time);
+      if(item.shots && typeof item.shots === "object"){
+        SHOT_TYPES.forEach(function(st){
+          if(!isSafePhotoRef(item.shots[st.key])) item.shots[st.key] = null;
+        });
+      } else {
+        item.shots = {far:null, medium:null, near:null, macro:null};
+      }
+      if(item.photo !== undefined && !isSafePhotoRef(item.photo)) item.photo = null;
+    });
+
+    if(data.sections && typeof data.sections === "object"){
+      SECTIONS.forEach(function(s){
+        var list = data.sections[s.key];
+        if(!Array.isArray(list)){ data.sections[s.key] = []; return; }
+        list.forEach(function(entry){
+          entry.note = str(entry.note);
+          entry.time = str(entry.time);
+          if(!isSafePhotoRef(entry.photo)) entry.photo = null;
+        });
+      });
+    } else {
+      data.sections = {};
+    }
+  }
+
   document.getElementById("btnImport").addEventListener("click", function(){
     var html =
       '<div class="hint" style="margin-bottom:10px;">把之前複製的備份文字貼在下面（長按輸入框，選「貼上」），再點「匯入」。</div>' +
@@ -1769,6 +1954,7 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var n,r,i,a,
         try{
           var data = JSON.parse(raw);
           if(!data || !data.meta || !Array.isArray(data.items)) throw new Error("格式錯誤");
+          sanitizeImportedCase(data);
           var id = uid();
           localStorage.setItem(LS_CASE_PREFIX+id, JSON.stringify(data));
           var list = getCaseList();
@@ -1839,40 +2025,28 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var n,r,i,a,
     });
   }
 
-  // Lays out up to 4 labelled images in a grid within the given area.
-  function addPhotoGridToPdf(doc, images, margin, top, pageW, pageH){
-    var cols = images.length > 1 ? 2 : 1;
-    var gap = 10;
-    var cellW = (pageW - margin * 2 - gap * (cols - 1)) / cols;
-    var availH = pageH - top - margin;
-    var rows = Math.max(1, Math.ceil(images.length / cols));
-    var cellH = (availH - gap * (rows - 1)) / rows;
-
-    var chain = Promise.resolve();
-    images.forEach(function(info, idx){
-      chain = chain.then(function(){
-        return loadImageMeta(info.dataUrl).then(function(meta){
-          var col = idx % cols;
-          var row = Math.floor(idx / cols);
-          var cellX = margin + col * (cellW + gap);
-          var cellY = top + row * (cellH + gap);
-          var labelH = 12;
-          var w = meta.width || cellW;
-          var h = meta.height || (cellH - labelH);
-          var scale = Math.min(cellW / w, (cellH - labelH) / h, 1);
-          var drawW = w * scale;
-          var drawH = h * scale;
-          var drawX = cellX + (cellW - drawW) / 2;
-          try{ doc.addImage(info.dataUrl, "JPEG", drawX, cellY, drawW, drawH); }catch(e){}
-          doc.setFont("helvetica", "normal");
-          doc.setFontSize(8);
-          doc.text(info.label, cellX, cellY + cellH - 2);
-        });
-      });
-    });
-    return chain;
+  function pdfPageHeader(doc, caseNo, pageW, margin){
+    doc.setFont("helvetica", "bold");
+    doc.setFontSize(14);
+    doc.text(String(caseNo || ""), margin, 40);
+    doc.setDrawColor(180);
+    doc.setLineWidth(0.75);
+    doc.line(margin, 48, pageW - margin, 48);
   }
 
+  function pdfPageFooter(doc, page, total, pageW, pageH){
+    doc.setFont("helvetica", "normal");
+    doc.setFontSize(9);
+    var txt = "第 " + page + " 頁，共 " + total + " 頁";
+    var w = doc.getTextWidth(txt);
+    doc.text(txt, (pageW - w) / 2, pageH - 24);
+  }
+
+  // One photo per page, in a fixed running order: location signage, then
+  // scene layout, then every evidence item (smallest number to largest,
+  // each item's far/medium/near/macro shots in that order), then "other".
+  // Every photo gets a single running caption ("照片1", "照片2", …) across
+  // the whole document, matching the department's existing report format.
   function buildPdf(d){
     ensureSections(d);
     var JsPDF = window.jspdf && window.jspdf.jsPDF;
@@ -1882,83 +2056,80 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var n,r,i,a,
     var pageH = doc.internal.pageSize.getHeight();
     var margin = 42;
 
-    doc.setFont("helvetica", "bold");
-    doc.setFontSize(15);
-    doc.text(String(d.meta.caseNo || "Evidence Log"), margin, 50);
-    doc.setFont("helvetica", "normal");
-    doc.setFontSize(9);
-    var y = 70;
-    if(d.meta.location){ doc.text("Location: " + d.meta.location, margin, y); y += 14; }
-    if(d.meta.recorder){ doc.text("Recorder: " + d.meta.recorder, margin, y); y += 14; }
-    if(d.meta.date){ doc.text("Date: " + d.meta.date, margin, y); y += 14; }
-    doc.text("Total items: " + d.items.length, margin, y);
+    var photoList = [];
 
-    var chain = Promise.resolve();
+    (d.sections.environment || []).forEach(function(entry, idx){
+      if(entry.photo){
+        photoList.push({ photo: entry.photo, caption: "地點門牌-" + (idx + 1), note: entry.note || "" });
+      }
+    });
 
-    function addSectionPages(sectionKey, title){
-      var list = d.sections[sectionKey] || [];
-      list.forEach(function(entry){
-        chain = chain.then(function(){
-          doc.addPage();
-          var yy = 50;
-          doc.setFont("helvetica", "bold");
-          doc.setFontSize(13);
-          doc.text(title, margin, yy);
-          doc.setFont("helvetica", "normal");
-          doc.setFontSize(9);
-          doc.text(String(entry.time || ""), pageW - margin - 100, yy);
-          yy += 18;
-          if(entry.note){
-            doc.setFontSize(10);
-            var lines = doc.splitTextToSize(entry.note, pageW - margin * 2);
-            doc.text(lines, margin, yy);
-            yy += lines.length * 13 + 8;
-          }
-          if(entry.photo){
-            return loadImageMeta(entry.photo).then(function(meta){
-              var maxW = pageW - margin * 2;
-              var maxH = pageH - yy - margin;
-              var w = meta.width || maxW;
-              var h = meta.height || maxH;
-              var scale = Math.min(maxW / w, maxH / h, 1);
-              try{ doc.addImage(entry.photo, "JPEG", margin, yy, w * scale, h * scale); }catch(e){}
-            });
-          }
-        });
-      });
-    }
+    (d.sections.layout || []).forEach(function(entry, idx){
+      if(entry.photo){
+        photoList.push({ photo: entry.photo, caption: "現場格局-" + (idx + 1), note: entry.note || "" });
+      }
+    });
 
-    addSectionPages("environment", "Location / Signage (地點門牌)");
-    addSectionPages("layout", "Scene Layout (現場格局)");
-
-    d.items.forEach(function(item){
-      chain = chain.then(function(){
-        doc.addPage();
-        var yy = 50;
-        doc.setFont("helvetica", "bold");
-        doc.setFontSize(14);
-        doc.text(String(item.number), margin, yy);
-        doc.setFont("helvetica", "normal");
-        doc.setFontSize(9);
-        doc.text(String(item.time || ""), pageW - margin - 100, yy);
-        yy += 20;
-        if(item.note){
-          doc.setFontSize(10);
-          var lines = doc.splitTextToSize(item.note, pageW - margin * 2);
-          doc.text(lines, margin, yy);
-          yy += lines.length * 13 + 10;
-        }
-        var shots = ensureShots(item);
-        var images = SHOT_TYPES
-          .map(function(st){ return {label: st.label, dataUrl: shots[st.key]}; })
-          .filter(function(x){ return !!x.dataUrl; });
-        if(images.length){
-          return addPhotoGridToPdf(doc, images, margin, yy, pageW, pageH);
+    sortedItems(d).forEach(function(item){
+      var shots = ensureShots(item);
+      SHOT_TYPES.forEach(function(st){
+        var photo = shots[st.key];
+        if(photo){
+          photoList.push({ photo: photo, caption: item.number + " " + st.label, note: item.note || "" });
         }
       });
     });
 
-    addSectionPages("other", "Other (其他)");
+    (d.sections.other || []).forEach(function(entry, idx){
+      if(entry.photo){
+        photoList.push({ photo: entry.photo, caption: "其他-" + (idx + 1), note: entry.note || "" });
+      }
+    });
+
+    var total = photoList.length;
+    var chain = Promise.resolve();
+
+    if(total === 0){
+      chain = chain.then(function(){
+        pdfPageHeader(doc, d.meta.caseNo, pageW, margin);
+        doc.setFont("helvetica", "normal");
+        doc.setFontSize(11);
+        doc.text("（尚無照片）", margin, 120);
+        pdfPageFooter(doc, 1, 1, pageW, pageH);
+      });
+      return chain.then(function(){ return doc; });
+    }
+
+    photoList.forEach(function(info, idx){
+      chain = chain.then(function(){
+        if(idx > 0) doc.addPage();
+        pdfPageHeader(doc, d.meta.caseNo, pageW, margin);
+        return loadImageMeta(info.photo).then(function(meta){
+          var top = 62;
+          var captionH = info.note ? 46 : 26;
+          var maxW = pageW - margin * 2;
+          var maxH = pageH - top - margin - captionH;
+          var w = meta.width || maxW;
+          var h = meta.height || maxH;
+          var scale = Math.min(maxW / w, maxH / h, 1);
+          var drawW = w * scale;
+          var drawH = h * scale;
+          var drawX = margin + (maxW - drawW) / 2;
+          try{ doc.addImage(info.photo, "JPEG", drawX, top, drawW, drawH); }catch(e){}
+
+          var capY = top + drawH + 18;
+          doc.setFont("helvetica", "normal");
+          doc.setFontSize(10);
+          doc.text("照片" + (idx + 1) + "：" + info.caption, margin, capY);
+          if(info.note){
+            doc.setFontSize(9);
+            var lines = doc.splitTextToSize(info.note, pageW - margin * 2);
+            doc.text(lines, margin, capY + 14);
+          }
+          pdfPageFooter(doc, idx + 1, total, pageW, pageH);
+        });
+      });
+    });
 
     return chain.then(function(){ return doc; });
   }
