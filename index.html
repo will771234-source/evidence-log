@@ -1331,7 +1331,12 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var n,r,i,a,
       prefix: numInfo.prefix,
       seq: numInfo.seq,
       shots: {far:null, medium:null, near:null, macro:null},
-      note: "",
+      // Pre-fill a "照片N：" template so there's something to tap into and
+      // continue typing after, instead of starting from a blank field.
+      // N is simply this evidence item's position within the case (1st
+      // item created = 照片1, 2nd = 照片2, …) — separate from the A1/A2-style
+      // editable evidence number, which can have a custom prefix.
+      note: "照片" + (d.items.length + 1) + "：",
       time: fullTimeStr()
     };
     d.items.push(item);
@@ -1397,7 +1402,7 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var n,r,i,a,
     compressImage(file, cb);
   });
 
-  // Compresses to roughly 3x4" print quality (long edge ~1600px) and hands
+  // Compresses to roughly 2:3 print quality (long edge ~1600px) and hands
   // back a JPEG Blob ready for OPFS storage.
   function compressImage(file, cb){
     var reader = new FileReader();
@@ -1406,11 +1411,11 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var n,r,i,a,
       img.onload = function(){
         var srcW = img.width, srcH = img.height;
 
-        // Center-crop to a 3x4 print ratio, matching whichever orientation
+        // Center-crop to a 2:3 print ratio, matching whichever orientation
         // the photo was actually taken in (landscape shots -> 4:3 wide,
         // portrait shots -> 3:4 tall).
         var isPortrait = srcH >= srcW;
-        var targetRatio = isPortrait ? (3 / 4) : (4 / 3); // width / height
+        var targetRatio = isPortrait ? (2 / 3) : (3 / 2); // width / height
         var srcRatio = srcW / srcH;
         var cropX, cropY, cropW, cropH;
         if(srcRatio > targetRatio){
@@ -2073,7 +2078,7 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var n,r,i,a,
     var color = opts.color || "#000000";
     var maxWidthPt = opts.maxWidthPt || 500;
     var lineHeightPt = Math.round(sizePt * 1.5);
-    var fontSpec = (bold ? "700 " : "400 ") + sizePt + "px -apple-system, 'PingFang TC', 'Noto Sans TC', 'Microsoft JhengHei', sans-serif";
+    var fontSpec = (bold ? "700 " : "400 ") + sizePt + "px 'DFKai-SB', 'BiauKai', 'Kaiti TC', 'Kaiti SC', '標楷體', '楷體', serif";
 
     var measure = document.createElement("canvas").getContext("2d");
     measure.font = fontSpec;
