@@ -202,16 +202,35 @@
   .toast.show{opacity:1;}
 
   @media (orientation: landscape) and (min-width: 640px){
-    main{ max-width: none; padding-left: 24px; padding-right: 24px; }
+    body{
+      display: flex; flex-direction: row; align-items: stretch;
+      height: 100vh; overflow: hidden; padding-bottom: 0;
+    }
+    .appchrome{
+      width: 300px; min-width: 300px; height: 100vh; overflow-y: auto;
+      border-right: 1px solid var(--line);
+      display: flex; flex-direction: column; gap: 10px;
+      padding: 14px 14px calc(14px + env(safe-area-inset-bottom));
+    }
+    .appchrome header.topbar{
+      position: static; border-bottom: none; padding: 0;
+    }
+    .toolbar, .tabbar, .prefixbar{ max-width: none; margin-top: 0; }
+    .toolbar{ flex-direction: column; }
+    .toolbar button{ flex: none; }
+    .tabbar{ flex-direction: column; }
+    .prefixbar{ flex-direction: column; align-items: flex-start; gap: 8px; }
+    main{
+      flex: 1; height: 100vh; overflow-y: auto;
+      padding: 16px 22px calc(96px + env(safe-area-inset-bottom));
+      max-width: none; margin: 0;
+    }
     .grid{
       display: grid;
       grid-template-columns: repeat(auto-fill, minmax(360px, 1fr));
       align-items: start;
       gap: 12px;
     }
-    .toolbar{ max-width: 900px; }
-    .tabbar{ max-width: 900px; }
-    .prefixbar{ max-width: 900px; }
   }
 
   @media print{
@@ -225,15 +244,15 @@
 </head>
 <body>
 
-<header class="topbar">
-  <div class="brand">
-    <h1 id="caseTitle">證物紀錄</h1>
-    <button class="case-switch" id="btnCases">切換案件</button>
-  </div>
-  <div class="caseline" id="caseLine"></div>
-</header>
+<div class="appchrome">
+  <header class="topbar">
+    <div class="brand">
+      <h1 id="caseTitle">證物紀錄</h1>
+      <button class="case-switch" id="btnCases">切換案件</button>
+    </div>
+    <div class="caseline" id="caseLine"></div>
+  </header>
 
-<main>
   <div class="toolbar">
     <button id="btnEditCase">案件資訊</button>
     <button id="btnExport">匯出備份</button>
@@ -243,9 +262,9 @@
   </div>
 
   <div class="tabbar" id="tabBar" style="display:none;">
-    <button class="tabbtn" data-tab="items">證物</button>
     <button class="tabbtn" data-tab="environment">地點門牌</button>
     <button class="tabbtn" data-tab="layout">現場格局</button>
+    <button class="tabbtn" data-tab="items">證物</button>
     <button class="tabbtn" data-tab="other">其他</button>
   </div>
 
@@ -253,7 +272,9 @@
     <span>目前編號：<b id="prefixBarLabel">1、2、3…</b></span>
     <button id="btnSwitchPrefix">切換／新增編號</button>
   </div>
+</div>
 
+<main>
   <div id="emptyState" class="empty" style="display:none;">
     <div class="big">尚無案件</div>
     <div class="small">點右下角「＋」建立第一筆證物，<br>系統會自動開新案件並產生編號。</div>
@@ -2157,6 +2178,8 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var n,r,i,a,
     });
 
     var total = photoList.length;
+    var perPage = 2;
+    var totalPages = Math.max(1, Math.ceil(total / perPage));
     var chain = Promise.resolve();
 
     if(total === 0){
@@ -2168,32 +2191,53 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var n,r,i,a,
       return chain.then(function(){ return doc; });
     }
 
-    photoList.forEach(function(info, idx){
-      chain = chain.then(function(){
-        if(idx > 0) doc.addPage();
-        pdfPageHeader(doc, d.meta.caseNo, pageW, margin);
-        return loadImageMeta(info.photo).then(function(meta){
-          var top = 62;
-          var captionH = info.note ? 46 : 26;
-          var maxW = pageW - margin * 2;
-          var maxH = pageH - top - margin - captionH;
-          var w = meta.width || maxW;
-          var h = meta.height || maxH;
-          var scale = Math.min(maxW / w, maxH / h, 1);
-          var drawW = w * scale;
-          var drawH = h * scale;
-          var drawX = margin + (maxW - drawW) / 2;
-          try{ doc.addImage(info.photo, "JPEG", drawX, top, drawW, drawH); }catch(e){}
+    var headerH = 62;
+    var footerClearance = 40;
+    var availH = pageH - headerH - margin - footerClearance;
+    var slotGap = 18;
+    var slotH = (availH - slotGap) / perPage;
 
-          var capY = top + drawH + 16;
-          var capImg = drawText(doc, "照片" + (idx + 1) + "：" + info.caption, margin, capY, { sizePt: 10, maxWidthPt: maxW });
-          if(info.note){
-            drawText(doc, info.note, margin, capY + capImg.heightPt + 4, { sizePt: 9, maxWidthPt: maxW });
+    for(var pageIdx = 0; pageIdx < totalPages; pageIdx++){
+      (function(pageIdx){
+        chain = chain.then(function(){
+          if(pageIdx > 0) doc.addPage();
+          pdfPageHeader(doc, d.meta.caseNo, pageW, margin);
+
+          var slotChain = Promise.resolve();
+          for(var slot = 0; slot < perPage; slot++){
+            var photoIdx = pageIdx * perPage + slot;
+            if(photoIdx >= total) break;
+            (function(slot, photoIdx){
+              slotChain = slotChain.then(function(){
+                var info = photoList[photoIdx];
+                var slotTop = headerH + slot * (slotH + slotGap);
+                return loadImageMeta(info.photo).then(function(meta){
+                  var maxW = pageW - margin * 2;
+                  var captionH = info.note ? 40 : 22;
+                  var maxH = slotH - captionH;
+                  var w = meta.width || maxW;
+                  var h = meta.height || maxH;
+                  var scale = Math.min(maxW / w, maxH / h, 1);
+                  var drawW = w * scale;
+                  var drawH = h * scale;
+                  var drawX = margin + (maxW - drawW) / 2;
+                  try{ doc.addImage(info.photo, "JPEG", drawX, slotTop, drawW, drawH); }catch(e){}
+
+                  var capY = slotTop + drawH + 12;
+                  var capImg = drawText(doc, "照片" + (photoIdx + 1) + "：" + info.caption, margin, capY, { sizePt: 10, maxWidthPt: maxW });
+                  if(info.note){
+                    drawText(doc, info.note, margin, capY + capImg.heightPt + 3, { sizePt: 9, maxWidthPt: maxW });
+                  }
+                });
+              });
+            })(slot, photoIdx);
           }
-          pdfPageFooter(doc, idx + 1, total, pageW, pageH);
+          return slotChain.then(function(){
+            pdfPageFooter(doc, pageIdx + 1, totalPages, pageW, pageH);
+          });
         });
-      });
-    });
+      })(pageIdx);
+    }
 
     return chain.then(function(){ return doc; });
   }
@@ -2275,7 +2319,32 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var n,r,i,a,
         render();
       }
     }
+    maybeShowLandscapeReminder();
   }
+
+  // Browsers can't force screen orientation on a normal web page, so instead
+  // of a hard lock, nudge the person to rotate manually — landscape gives a
+  // much better layout here (sidebar controls + wider photo grid) and photos
+  // shot in landscape need less cropping to hit the required 3x4 ratio.
+  function maybeShowLandscapeReminder(){
+    if(window.innerWidth >= window.innerHeight) return; // already landscape
+    if(Math.max(window.innerWidth, window.innerHeight) < 500) return; // too small to bother (e.g. tiny/old device)
+    openModal(
+      "建議橫拿手機操作",
+      '<div class="hint" style="margin-bottom:4px; color:var(--ink);">把手機轉成橫向，畫面會切換成側邊欄排版，操作空間更大，拍出來的照片也更符合列印用的 3x4 比例。</div>',
+      [ {label:"知道了", cls:"primary"} ],
+      {center:true}
+    );
+  }
+
+  window.addEventListener("orientationchange", function(){
+    setTimeout(function(){
+      if(window.innerWidth < window.innerHeight){
+        toast("建議轉為橫向操作，畫面會更好用");
+      }
+    }, 350);
+  });
+
   boot();
 
 })();
