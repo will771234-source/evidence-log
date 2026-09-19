@@ -201,6 +201,19 @@
   }
   .toast.show{opacity:1;}
 
+  @media (orientation: landscape) and (min-width: 640px){
+    main{ max-width: none; padding-left: 24px; padding-right: 24px; }
+    .grid{
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(360px, 1fr));
+      align-items: start;
+      gap: 12px;
+    }
+    .toolbar{ max-width: 900px; }
+    .tabbar{ max-width: 900px; }
+    .prefixbar{ max-width: 900px; }
+  }
+
   @media print{
     header.topbar, .fab, .toolbar, .card .row2, .card textarea.note{ }
     body{background:#fff; color:#000; padding-bottom:0;}
@@ -1363,9 +1376,8 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var n,r,i,a,
     compressImage(file, cb);
   });
 
-  // Compresses to roughly 4x6" print quality (long edge ~1600px, which is
-  // about 266 DPI at 6 inches — plenty for both on-screen review and a
-  // printed report) and hands back a JPEG Blob ready for OPFS storage.
+  // Compresses to roughly 3x4" print quality (long edge ~1600px) and hands
+  // back a JPEG Blob ready for OPFS storage.
   function compressImage(file, cb){
     var reader = new FileReader();
     reader.onload = function(ev){
@@ -1373,27 +1385,28 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var n,r,i,a,
       img.onload = function(){
         var srcW = img.width, srcH = img.height;
 
-        // Center-crop to a 4x6 print ratio (2:3), matching whichever
-        // orientation the photo was actually taken in.
+        // Center-crop to a 3x4 print ratio, matching whichever orientation
+        // the photo was actually taken in (landscape shots -> 4:3 wide,
+        // portrait shots -> 3:4 tall).
         var isPortrait = srcH >= srcW;
-        var targetRatio = isPortrait ? (4 / 6) : (6 / 4); // width / height
+        var targetRatio = isPortrait ? (3 / 4) : (4 / 3); // width / height
         var srcRatio = srcW / srcH;
         var cropX, cropY, cropW, cropH;
         if(srcRatio > targetRatio){
-          // source is relatively wider than 4x6 -> trim left/right
+          // source is relatively wider than 3x4 -> trim left/right
           cropH = srcH;
           cropW = Math.round(srcH * targetRatio);
           cropX = Math.round((srcW - cropW) / 2);
           cropY = 0;
         } else {
-          // source is relatively taller than 4x6 -> trim top/bottom
+          // source is relatively taller than 3x4 -> trim top/bottom
           cropW = srcW;
           cropH = Math.round(srcW / targetRatio);
           cropX = 0;
           cropY = Math.round((srcH - cropH) / 2);
         }
 
-        var maxDim = 1600; // long edge, ~266 DPI at 6" — good print quality
+        var maxDim = 1600; // long edge — good print quality
         var scale = Math.min(1, maxDim / Math.max(cropW, cropH));
         var outW = Math.round(cropW * scale);
         var outH = Math.round(cropH * scale);
@@ -2025,21 +2038,78 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var n,r,i,a,
     });
   }
 
+  // Renders a line (or wrapped multiple lines) of text to a PNG data URL
+  // using the browser's own text rendering — which, unlike jsPDF's built-in
+  // fonts, has no trouble at all with Chinese, since it just uses whatever
+  // CJK font the OS already has installed (PingFang TC on iOS). This sidesteps
+  // jsPDF's fragile custom-TTF-embedding code path entirely for CJK text.
+  // Returns {dataUrl, widthPt, heightPt} sized directly in PDF points, so the
+  // caller can hand widthPt/heightPt straight to doc.addImage().
+  function renderTextToImage(text, opts){
+    opts = opts || {};
+    var sizePt = opts.sizePt || 11;
+    var bold = !!opts.bold;
+    var color = opts.color || "#000000";
+    var maxWidthPt = opts.maxWidthPt || 500;
+    var lineHeightPt = Math.round(sizePt * 1.5);
+    var fontSpec = (bold ? "700 " : "400 ") + sizePt + "px -apple-system, 'PingFang TC', 'Noto Sans TC', 'Microsoft JhengHei', sans-serif";
+
+    var measure = document.createElement("canvas").getContext("2d");
+    measure.font = fontSpec;
+
+    // Manual character-by-character wrap: CJK text has no spaces to break on.
+    var lines = [];
+    var current = "";
+    for(var i = 0; i < text.length; i++){
+      var ch = text[i];
+      if(ch === "\n"){ lines.push(current); current = ""; continue; }
+      var test = current + ch;
+      if(measure.measureText(test).width > maxWidthPt && current){
+        lines.push(current);
+        current = ch;
+      } else {
+        current = test;
+      }
+    }
+    lines.push(current);
+
+    var widthPt = 0;
+    lines.forEach(function(l){ widthPt = Math.max(widthPt, measure.measureText(l).width); });
+    widthPt = Math.min(widthPt, maxWidthPt) || 1;
+    var heightPt = lineHeightPt * lines.length;
+
+    var scale = 3; // supersample for crisp text at print resolution
+    var canvas = document.createElement("canvas");
+    canvas.width = Math.max(1, Math.ceil(widthPt * scale));
+    canvas.height = Math.max(1, Math.ceil(heightPt * scale));
+    var ctx = canvas.getContext("2d");
+    ctx.scale(scale, scale);
+    ctx.font = fontSpec;
+    ctx.fillStyle = color;
+    ctx.textBaseline = "top";
+    lines.forEach(function(line, i){ ctx.fillText(line, 0, i * lineHeightPt); });
+
+    return { dataUrl: canvas.toDataURL("image/png"), widthPt: widthPt, heightPt: heightPt, lineCount: lines.length };
+  }
+
+  function drawText(doc, text, x, y, opts){
+    var img = renderTextToImage(text, opts);
+    try{ doc.addImage(img.dataUrl, "PNG", x, y, img.widthPt, img.heightPt); }catch(e){}
+    return img;
+  }
+
   function pdfPageHeader(doc, caseNo, pageW, margin){
-    doc.setFont("helvetica", "bold");
-    doc.setFontSize(14);
-    doc.text(String(caseNo || ""), margin, 40);
+    drawText(doc, String(caseNo || ""), margin, 26, { sizePt: 15, bold: true, maxWidthPt: pageW - margin * 2 });
     doc.setDrawColor(180);
     doc.setLineWidth(0.75);
     doc.line(margin, 48, pageW - margin, 48);
   }
 
   function pdfPageFooter(doc, page, total, pageW, pageH){
-    doc.setFont("helvetica", "normal");
-    doc.setFontSize(9);
     var txt = "第 " + page + " 頁，共 " + total + " 頁";
-    var w = doc.getTextWidth(txt);
-    doc.text(txt, (pageW - w) / 2, pageH - 24);
+    var img = renderTextToImage(txt, { sizePt: 9, maxWidthPt: pageW });
+    var x = (pageW - img.widthPt) / 2;
+    try{ doc.addImage(img.dataUrl, "PNG", x, pageH - 30, img.widthPt, img.heightPt); }catch(e){}
   }
 
   // One photo per page, in a fixed running order: location signage, then
@@ -2092,9 +2162,7 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var n,r,i,a,
     if(total === 0){
       chain = chain.then(function(){
         pdfPageHeader(doc, d.meta.caseNo, pageW, margin);
-        doc.setFont("helvetica", "normal");
-        doc.setFontSize(11);
-        doc.text("（尚無照片）", margin, 120);
+        drawText(doc, "（尚無照片）", margin, 100, { sizePt: 11, maxWidthPt: pageW - margin * 2 });
         pdfPageFooter(doc, 1, 1, pageW, pageH);
       });
       return chain.then(function(){ return doc; });
@@ -2117,14 +2185,10 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var n,r,i,a,
           var drawX = margin + (maxW - drawW) / 2;
           try{ doc.addImage(info.photo, "JPEG", drawX, top, drawW, drawH); }catch(e){}
 
-          var capY = top + drawH + 18;
-          doc.setFont("helvetica", "normal");
-          doc.setFontSize(10);
-          doc.text("照片" + (idx + 1) + "：" + info.caption, margin, capY);
+          var capY = top + drawH + 16;
+          var capImg = drawText(doc, "照片" + (idx + 1) + "：" + info.caption, margin, capY, { sizePt: 10, maxWidthPt: maxW });
           if(info.note){
-            doc.setFontSize(9);
-            var lines = doc.splitTextToSize(info.note, pageW - margin * 2);
-            doc.text(lines, margin, capY + 14);
+            drawText(doc, info.note, margin, capY + capImg.heightPt + 4, { sizePt: 9, maxWidthPt: maxW });
           }
           pdfPageFooter(doc, idx + 1, total, pageW, pageH);
         });
