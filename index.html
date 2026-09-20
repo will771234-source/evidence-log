@@ -260,6 +260,7 @@
     <button id="btnPrint">列印 / PDF</button>
     <button id="btnStorage">儲存空間</button>
     <button id="btnExportZip">匯出照片(ZIP)</button>
+    <button id="btnExportMatched">匯出至照片整理程式</button>
   </div>
 
   <div class="tabbar" id="tabBar" style="display:none;">
@@ -2146,6 +2147,92 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var n,r,i,a,
   // each item's far/medium/near/macro shots in that order), then "other".
   // Every photo gets a single running caption ("照片1", "照片2", …) across
   // the whole document, matching the department's existing report format.
+  // ---------- shared photo ordering + default caption scheme ----------
+  // Same order everywhere (location signage -> layout -> evidence, smallest
+  // number to largest with far/medium/near/macro shots in that order ->
+  // other) so the PDF, the photo ZIP, and the JSON export for the photo
+  // organizer program all agree with each other.
+  //
+  // Default captions follow the department's fixed naming scheme for the
+  // first N photos in each category; anything beyond that needs a manually
+  // typed description (this matches "新增的名稱需自行輸入" in the spec).
+  // A person's own note always overrides the default when present.
+  var DEFAULT_CAPTIONS_ENVIRONMENT = ["現場環境外觀-1", "現場環境外觀-2", "現場環境外觀-3", "現場門牌", "現場門口", "門鎖"];
+  var DEFAULT_CAPTIONS_LAYOUT = ["現場內部環境-1", "現場內部環境-2", "現場內部環境-3", "現場內部環境-4", "現場內部環境-1", "現場內部環境-2", "現場內部環境-3", "現場內部環境-4"];
+
+  function defaultCaptionForSection(sectionKey, pos){
+    var list = sectionKey === "environment" ? DEFAULT_CAPTIONS_ENVIRONMENT
+             : sectionKey === "layout" ? DEFAULT_CAPTIONS_LAYOUT
+             : null;
+    return (list && list[pos - 1]) || "";
+  }
+
+  function defaultCaptionForShot(evidenceOrder, shotKey){
+    switch(shotKey){
+      case "far":    return "證物編號" + evidenceOrder + "位置-1";
+      case "medium": return "證物編號" + evidenceOrder + "位置-2";
+      case "near":   return "證物編號" + evidenceOrder + "(內容+數量)";
+      case "macro":  return "證物編號" + evidenceOrder + "(採證情形)";
+      default:       return "";
+    }
+  }
+
+  function buildPhotoList(d){
+    ensureSections(d);
+    var list = [];
+
+    (d.sections.environment || []).forEach(function(entry, idx){
+      if(entry.photo){
+        list.push({
+          photo: entry.photo,
+          note: entry.note || "",
+          fallback: defaultCaptionForSection("environment", idx + 1),
+          filenameBase: "地點門牌-" + (idx + 1)
+        });
+      }
+    });
+
+    (d.sections.layout || []).forEach(function(entry, idx){
+      if(entry.photo){
+        list.push({
+          photo: entry.photo,
+          note: entry.note || "",
+          fallback: defaultCaptionForSection("layout", idx + 1),
+          filenameBase: "現場格局-" + (idx + 1)
+        });
+      }
+    });
+
+    sortedItems(d).forEach(function(item, evIdx){
+      var shots = ensureShots(item);
+      var evOrder = evIdx + 1;
+      SHOT_TYPES.forEach(function(st){
+        var photo = shots[st.key];
+        if(photo){
+          list.push({
+            photo: photo,
+            note: item.note || "",
+            fallback: defaultCaptionForShot(evOrder, st.key),
+            filenameBase: sanitizeFilenamePart(item.number) + "_" + st.label
+          });
+        }
+      });
+    });
+
+    (d.sections.other || []).forEach(function(entry, idx){
+      if(entry.photo){
+        list.push({
+          photo: entry.photo,
+          note: entry.note || "",
+          fallback: "其他-" + (idx + 1),
+          filenameBase: "其他-" + (idx + 1)
+        });
+      }
+    });
+
+    return list;
+  }
+
   function buildPdf(d){
     ensureSections(d);
     var JsPDF = window.jspdf && window.jspdf.jsPDF;
@@ -2155,34 +2242,8 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var n,r,i,a,
     var pageH = doc.internal.pageSize.getHeight();
     var margin = 42;
 
-    var photoList = [];
-
-    (d.sections.environment || []).forEach(function(entry, idx){
-      if(entry.photo){
-        photoList.push({ photo: entry.photo, caption: "地點門牌-" + (idx + 1), note: entry.note || "" });
-      }
-    });
-
-    (d.sections.layout || []).forEach(function(entry, idx){
-      if(entry.photo){
-        photoList.push({ photo: entry.photo, caption: "現場格局-" + (idx + 1), note: entry.note || "" });
-      }
-    });
-
-    sortedItems(d).forEach(function(item){
-      var shots = ensureShots(item);
-      SHOT_TYPES.forEach(function(st){
-        var photo = shots[st.key];
-        if(photo){
-          photoList.push({ photo: photo, caption: item.number + " " + st.label, note: item.note || "" });
-        }
-      });
-    });
-
-    (d.sections.other || []).forEach(function(entry, idx){
-      if(entry.photo){
-        photoList.push({ photo: entry.photo, caption: "其他-" + (idx + 1), note: entry.note || "" });
-      }
+    var photoList = buildPhotoList(d).map(function(p){
+      return { photo: p.photo, caption: p.fallback, note: p.note };
     });
 
     var total = photoList.length;
@@ -2302,37 +2363,14 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var n,r,i,a,
     return String(s || "").replace(/[\\\/:*?"<>|]+/g, "_").trim() || "photo";
   }
 
-  function pad2(n){ return n < 10 ? "0" + n : String(n); }
 
   // Same order as the PDF (location signage -> layout -> evidence, smallest
   // number to largest with far/medium/near/macro shots in that order ->
   // other), so filenames sort the same way the PDF pages read.
   function buildPhotoZipEntries(d){
-    ensureSections(d);
-    var entries = [];
-    var n = 0;
-
-    (d.sections.environment || []).forEach(function(entry, idx){
-      if(entry.photo){ n++; entries.push({ ref: entry.photo, filename: pad2(n) + "_地點門牌-" + (idx + 1) + ".jpg" }); }
+    return buildPhotoList(d).map(function(p, i){
+      return { ref: p.photo, filename: pad(i + 1, 3) + "_" + p.filenameBase + ".jpg" };
     });
-    (d.sections.layout || []).forEach(function(entry, idx){
-      if(entry.photo){ n++; entries.push({ ref: entry.photo, filename: pad2(n) + "_現場格局-" + (idx + 1) + ".jpg" }); }
-    });
-    sortedItems(d).forEach(function(item){
-      var shots = ensureShots(item);
-      SHOT_TYPES.forEach(function(st){
-        var photo = shots[st.key];
-        if(photo){
-          n++;
-          entries.push({ ref: photo, filename: pad2(n) + "_" + sanitizeFilenamePart(item.number) + "_" + st.label + ".jpg" });
-        }
-      });
-    });
-    (d.sections.other || []).forEach(function(entry, idx){
-      if(entry.photo){ n++; entries.push({ ref: entry.photo, filename: pad2(n) + "_其他-" + (idx + 1) + ".jpg" }); }
-    });
-
-    return entries;
   }
 
   function buildPhotoZipBlob(d){
@@ -2367,6 +2405,57 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var n,r,i,a,
       else { toast("打包失敗，請稍後再試"); }
     }).catch(function(e){
       toast("打包失敗：" + (e && e.message ? e.message : "未知錯誤"));
+    });
+  });
+
+  // ---------- export a project file for the "照片整理程式" companion tool ----------
+  // Matches that program's exact JSON schema so its own "載入工程檔" (open
+  // project file) feature can read it directly: { header, photoStart,
+  // quality, perPage, photos: [{ index, dataUrl, originalName, desc }] }.
+  // desc there is just the text AFTER "照片N:" — that program adds the
+  // "照片{index}:" prefix itself when it displays/exports, so we must NOT
+  // include it here or it would end up doubled.
+  function buildMatchedProgramExport(d){
+    var list = buildPhotoList(d);
+    return Promise.all(list.map(function(p, i){
+      return getPhotoBlob(p.photo).then(blobToDataUrl).then(function(dataUrl){
+        return {
+          index: i + 1,
+          dataUrl: dataUrl,
+          originalName: p.filenameBase + ".jpg",
+          desc: p.note || p.fallback
+        };
+      });
+    })).then(function(photos){
+      return {
+        header: d.meta.caseNo || "",
+        photoStart: 1,
+        quality: 85,
+        perPage: 2,
+        photos: photos
+      };
+    });
+  }
+
+  document.getElementById("btnExportMatched").addEventListener("click", function(){
+    if(!state.data){ toast("尚無案件可匯出"); return; }
+    var d = state.data;
+    var list = buildPhotoList(d);
+    if(!list.length){ toast("尚無任何照片可匯出"); return; }
+    toast("正在準備資料…");
+    buildMatchedProgramExport(d).then(function(projectData){
+      var jsonStr = JSON.stringify(projectData);
+      var blob = new Blob([jsonStr], {type:"application/json"});
+      var safe = (d.meta.caseNo || "case").replace(/[\\\/:*?"<>|]+/g, "_");
+      var filename = safe + "_" + todayStr() + ".json";
+      return deliverFileBlob(blob, filename, "application/json");
+    }).then(function(method){
+      if(method === "share"){ toast("已開啟分享，選「儲存到檔案」即可"); }
+      else if(method === "download"){ toast("已產生工程檔，請查看下載/儲存提示"); }
+      else if(method === "newtab"){ toast("已在新分頁開啟，可用分享圖示儲存"); }
+      else { toast("匯出失敗，請稍後再試"); }
+    }).catch(function(e){
+      toast("匯出失敗：" + (e && e.message ? e.message : "未知錯誤"));
     });
   });
 
