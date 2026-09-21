@@ -789,11 +789,78 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var n,r,i,a,
     return Promise.resolve();
   })();
 
+  // Safari didn't support createWritable() (the simple main-thread write
+  // API) until Safari 26 / iOS 26. Older Safari only offers the OPFS write
+  // path via createSyncAccessHandle() — and WebKit restricts that to inside
+  // a dedicated Web Worker. So: try the easy main-thread way first, and if
+  // that specific method doesn't exist, transparently fall back to a tiny
+  // worker that does the write via createSyncAccessHandle instead. Reading
+  // and deleting are unaffected by this — both have always worked fine on
+  // the main thread regardless of which API wrote the file.
+  var opfsWriteMode = null; // becomes "writable" or "worker" once known
+  var opfsWorker = null;
+  var opfsWorkerNextId = 1;
+  var opfsWorkerCallbacks = {};
+
+  var OPFS_WORKER_SRC = [
+    'self.onmessage = async function(e){',
+    '  var msg = e.data;',
+    '  try{',
+    '    var root = await navigator.storage.getDirectory();',
+    '    var handle = await root.getFileHandle(msg.filename, {create:true});',
+    '    var access = await handle.createSyncAccessHandle();',
+    '    access.truncate(0);',
+    '    access.write(new Uint8Array(msg.data), {at:0});',
+    '    access.flush();',
+    '    access.close();',
+    '    self.postMessage({id:msg.id, ok:true});',
+    '  }catch(err){',
+    '    self.postMessage({id:msg.id, ok:false, error:(err&&err.message)?err.message:String(err)});',
+    '  }',
+    '};'
+  ].join("\n");
+
+  function initOpfsWorker(){
+    if(opfsWorker) return;
+    var blob = new Blob([OPFS_WORKER_SRC], {type:"application/javascript"});
+    opfsWorker = new Worker(URL.createObjectURL(blob));
+    opfsWorker.onmessage = function(e){
+      var msg = e.data;
+      var cb = opfsWorkerCallbacks[msg.id];
+      if(!cb) return;
+      delete opfsWorkerCallbacks[msg.id];
+      if(msg.ok) cb.resolve(); else cb.reject(new Error(msg.error));
+    };
+  }
+
+  function writeViaWorker(filename, arrayBuffer){
+    initOpfsWorker();
+    return new Promise(function(resolve, reject){
+      var id = opfsWorkerNextId++;
+      opfsWorkerCallbacks[id] = {resolve:resolve, reject:reject};
+      opfsWorker.postMessage({ id:id, filename:filename, data:arrayBuffer }, [arrayBuffer]);
+    });
+  }
+
   function opfsWriteBlob(filename, blob){
+    if(opfsWriteMode === "worker"){
+      return blob.arrayBuffer().then(function(buf){ return writeViaWorker(filename, buf); });
+    }
+    // Try the simple main-thread path first (this is all that's needed on
+    // Safari 26+ / iOS 26+, and on Chrome/Firefox everywhere).
     return opfsRoot.getFileHandle(filename, {create:true}).then(function(handle){
-      return handle.createWritable();
-    }).then(function(writable){
-      return writable.write(blob).then(function(){ return writable.close(); });
+      if(typeof handle.createWritable !== "function"){
+        throw new Error("createWritable unsupported");
+      }
+      return handle.createWritable().then(function(writable){
+        return writable.write(blob).then(function(){ return writable.close(); });
+      });
+    }).then(function(){
+      opfsWriteMode = "writable";
+    }).catch(function(){
+      // Fall back to the Worker + createSyncAccessHandle path for older Safari.
+      opfsWriteMode = "worker";
+      return blob.arrayBuffer().then(function(buf){ return writeViaWorker(filename, buf); });
     });
   }
 
@@ -1825,7 +1892,7 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var n,r,i,a,
         .then(function(file){ return file.text(); })
         .then(function(text){
           opfsDelete(testName);
-          return text === "ok" ? { ok:true } : { ok:false, reason:"讀回的內容不正確" };
+          return text === "ok" ? { ok:true, mode:opfsWriteMode } : { ok:false, reason:"讀回的內容不正確" };
         })
         .catch(function(e){
           return { ok:false, reason:(e && e.message) ? e.message : String(e) };
@@ -1912,8 +1979,9 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var n,r,i,a,
         var resultEl = overlay.querySelector("#opfsSelftestResult");
         resultEl.textContent = "測試中…";
         testOpfsWrite().then(function(result){
+          var modeLabel = result.mode === "worker" ? "（透過 Worker 備援寫入，適用舊版 Safari）" : "（直接寫入）";
           resultEl.innerHTML = result.ok
-            ? '<span style="color:var(--ok);">✓ 實際寫入 / 讀取 / 刪除都成功，OPFS 正常運作</span>'
+            ? '<span style="color:var(--ok);">✓ 實際寫入 / 讀取 / 刪除都成功，OPFS 正常運作 '+modeLabel+'</span>'
             : '<span style="color:var(--danger);">✗ 測試失敗：'+esc(result.reason||"未知錯誤")+'</span>';
         });
       });
