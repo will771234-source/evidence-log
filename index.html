@@ -1812,11 +1812,62 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var n,r,i,a,
     return (n/1024/1024).toFixed(2) + " MB";
   }
 
+  // Actually writes, reads back, and deletes a small test file — this is a
+  // real functional test, not just "did getDirectory() succeed", since that
+  // alone doesn't guarantee individual file writes actually work.
+  function testOpfsWrite(){
+    return opfsReadyPromise.then(function(){
+      if(!opfsAvailable) return { ok:false, reason:"目錄存取失敗（getDirectory）" };
+      var testName = "opfs_selftest_" + Date.now() + ".txt";
+      var testBlob = new Blob(["ok"], {type:"text/plain"});
+      return opfsWriteBlob(testName, testBlob)
+        .then(function(){ return opfsReadBlob(testName); })
+        .then(function(file){ return file.text(); })
+        .then(function(text){
+          opfsDelete(testName);
+          return text === "ok" ? { ok:true } : { ok:false, reason:"讀回的內容不正確" };
+        })
+        .catch(function(e){
+          return { ok:false, reason:(e && e.message) ? e.message : String(e) };
+        });
+    });
+  }
+
+  // For each case, count how many photos are still old-style inline base64
+  // (from before OPFS existed, or a fallback when an OPFS write failed) vs
+  // properly offloaded to OPFS — this pinpoints whether a case's size is
+  // legacy leftovers or a sign OPFS isn't actually working.
+  function countPhotoRefsByCase(id){
+    var raw = localStorage.getItem(LS_CASE_PREFIX + id);
+    if(!raw) return { inline:0, opfs:0 };
+    var inline = 0, opfsCount = 0;
+    try{
+      var data = JSON.parse(raw);
+      var refs = [];
+      (data.items || []).forEach(function(item){
+        if(item.shots) Object.keys(item.shots).forEach(function(k){ refs.push(item.shots[k]); });
+        if(item.photo) refs.push(item.photo);
+      });
+      if(data.sections){
+        Object.keys(data.sections).forEach(function(sk){
+          (data.sections[sk] || []).forEach(function(entry){ refs.push(entry.photo); });
+        });
+      }
+      refs.forEach(function(ref){
+        if(!ref) return;
+        if(ref.indexOf("opfs:") === 0) opfsCount++;
+        else if(ref.indexOf("data:") === 0) inline++;
+      });
+    }catch(e){}
+    return { inline:inline, opfs:opfsCount };
+  }
+
   function openStorageDiagnostics(){
     var list = getCaseList();
     var rows = list.map(function(c){
       var raw = localStorage.getItem(LS_CASE_PREFIX + c.id) || "";
-      return { id: c.id, caseNo: c.caseNo || "未命名案件", bytes: raw.length };
+      var counts = countPhotoRefsByCase(c.id);
+      return { id: c.id, caseNo: c.caseNo || "未命名案件", bytes: raw.length, inline: counts.inline, opfs: counts.opfs };
     }).sort(function(a, b){ return b.bytes - a.bytes; });
 
     var totalLs = estimateLocalStorageBytes();
@@ -1825,7 +1876,9 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var n,r,i,a,
       '<div class="hint" style="margin-bottom:10px;">' +
       '照片儲存方式：<b style="color:'+(opfsAvailable ? "var(--ok)" : "var(--danger)")+';">' +
       (opfsAvailable ? "OPFS（大容量，新照片會存這裡）" : "⚠️ 瀏覽器內建空間（容量有限，約 5MB）") +
-      '</b></div>' +
+      '</b>　<button id="btnOpfsSelftest" style="font-size:11px; padding:4px 9px; border-radius:6px; border:1px solid var(--line); background:var(--bg-card); color:var(--ink);">實際測試讀寫</button>' +
+      '<div id="opfsSelftestResult" class="hint" style="margin-top:6px;"></div>' +
+      '</div>' +
       '<div class="hint" style="margin-bottom:14px;">文字資料（案件資訊、備份索引等）用量：<b>'+formatBytes(totalLs)+'</b>' +
       (totalLs > 3.5*1024*1024 ? '　<span style="color:var(--danger);">已接近上限</span>' : '') +
       '</div>';
@@ -1833,11 +1886,14 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var n,r,i,a,
     if(!rows.length){
       body += '<div class="hint">目前沒有任何案件。</div>';
     } else {
-      body += '<div class="hint" style="margin-bottom:8px;">各案件佔用的文字資料大小（由大到小；舊版本拍的照片若還沒搬到 OPFS，會佔用比較多空間，可以考慮刪除或匯出後刪除）：</div>';
+      body += '<div class="hint" style="margin-bottom:8px;">各案件佔用的文字資料大小（由大到小）。「舊式」代表照片還是直接內嵌成文字（OPFS 上線前拍的、或當時寫入失敗退回的），會佔用比較多空間：</div>';
       rows.forEach(function(r){
+        var photoInfo = (r.inline + r.opfs) > 0
+          ? ('　<span style="color:'+(r.inline>0?"var(--danger)":"var(--ink-dim)")+';">舊式 '+r.inline+' 張 ／ OPFS '+r.opfs+' 張</span>')
+          : '';
         body +=
           '<div class="caselist-item">' +
-            '<div class="info"><b>'+esc(r.caseNo)+'</b><span>'+formatBytes(r.bytes)+'</span></div>' +
+            '<div class="info"><b>'+esc(r.caseNo)+'</b><span>'+formatBytes(r.bytes)+photoInfo+'</span></div>' +
             '<div style="display:flex; gap:8px;">' +
               '<button class="diagOpenBtn" data-id="'+r.id+'">開啟</button>' +
               '<button class="diagDelBtn" data-id="'+r.id+'" style="color:var(--danger); border-color:var(--danger);">刪除</button>' +
@@ -1849,6 +1905,19 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var n,r,i,a,
     var overlay = openModal("儲存空間", body, [
       {label:"關閉", cls:"ghost"}
     ], {center:true});
+
+    var selftestBtn = overlay.querySelector("#btnOpfsSelftest");
+    if(selftestBtn){
+      selftestBtn.addEventListener("click", function(){
+        var resultEl = overlay.querySelector("#opfsSelftestResult");
+        resultEl.textContent = "測試中…";
+        testOpfsWrite().then(function(result){
+          resultEl.innerHTML = result.ok
+            ? '<span style="color:var(--ok);">✓ 實際寫入 / 讀取 / 刪除都成功，OPFS 正常運作</span>'
+            : '<span style="color:var(--danger);">✗ 測試失敗：'+esc(result.reason||"未知錯誤")+'</span>';
+        });
+      });
+    }
 
     overlay.querySelectorAll(".diagOpenBtn").forEach(function(btn){
       btn.addEventListener("click", function(){
