@@ -194,6 +194,32 @@
   .viewer .vbar .vnum{font-family:var(--mono); font-weight:700; color:var(--tag);}
   .viewer .vbar button{background:none; border:1px solid var(--line); color:var(--ink); padding:8px 14px; border-radius:8px; font-size:13px;}
 
+  .guided-camera{ position:fixed; inset:0; background:#000; z-index:90; }
+  .guided-camera video{ position:absolute; inset:0; width:100%; height:100%; object-fit:contain; background:#000; }
+  .guided-camera .crop-mask{
+    position:absolute; box-shadow:0 0 0 9999px rgba(0,0,0,.68);
+    border:2px solid var(--tag); pointer-events:none;
+  }
+  .guided-camera .crop-hint{
+    position:absolute; left:0; right:0; top:calc(14px + env(safe-area-inset-top));
+    text-align:center; color:#fff; font-size:12.5px; text-shadow:0 1px 3px rgba(0,0,0,.8);
+    pointer-events:none;
+  }
+  .guided-camera-bar{
+    position:absolute; left:0; right:0; bottom:0;
+    padding:16px 20px calc(16px + env(safe-area-inset-bottom));
+    display:flex; justify-content:space-between; align-items:center; gap:10px;
+    background:linear-gradient(to top, rgba(0,0,0,.75), transparent);
+  }
+  .guided-camera-bar button{
+    background:rgba(255,255,255,.14); color:#fff; border:1px solid rgba(255,255,255,.4);
+    padding:10px 14px; border-radius:10px; font-size:12.5px; white-space:nowrap;
+  }
+  .guided-camera-bar .shutter{
+    width:66px; height:66px; border-radius:50%; background:#fff;
+    border:4px solid rgba(255,255,255,.5); font-size:0; flex:none;
+  }
+
   .toast{
     position:fixed; left:50%; bottom:100px; transform:translateX(-50%);
     background:#2b2f36; color:var(--ink); padding:9px 16px; border-radius:20px; font-size:12.5px;
@@ -1382,6 +1408,127 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var n,r,i,a,
     document.getElementById("fileInput").click();
   }
 
+  // ---------- guided in-page camera with a live 2:3 crop-guide overlay ----------
+  // Experimental: the native camera (capturePhoto above) is the proven,
+  // reliable path since it hands off entirely to the OS's own camera app.
+  // This instead opens the live video feed directly on the page so we can
+  // draw a crop guide over it — genuinely useful, but getUserMedia support
+  // and behaviour varies more across browsers than the native-camera path
+  // does. If anything about it fails, or the person prefers it, this always
+  // falls straight back to capturePhoto() rather than getting stuck.
+  function openGuidedCamera(onDone){
+    if(!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia){
+      capturePhoto(onDone);
+      return;
+    }
+    navigator.mediaDevices.getUserMedia({
+      video: { facingMode: {ideal:"environment"}, width:{ideal:1920}, height:{ideal:1080} },
+      audio: false
+    }).then(function(stream){
+      showGuidedCameraUI(stream, onDone);
+    }).catch(function(){
+      // Permission denied, no camera, unsupported browser, etc. — fall back
+      // to the native camera rather than leaving the person stuck.
+      toast("無法開啟預覽相機，改用原生相機");
+      capturePhoto(onDone);
+    });
+  }
+
+  function showGuidedCameraUI(stream, onDone){
+    var wrap = document.createElement("div");
+    wrap.className = "guided-camera";
+
+    var video = document.createElement("video");
+    video.autoplay = true;
+    video.playsInline = true;
+    video.muted = true;
+    video.srcObject = stream;
+    wrap.appendChild(video);
+
+    var mask = document.createElement("div");
+    mask.className = "crop-mask";
+    wrap.appendChild(mask);
+
+    var hint = document.createElement("div");
+    hint.className = "crop-hint";
+    hint.textContent = "框線內＝實際會保留的範圍（2:3）";
+    wrap.appendChild(hint);
+
+    var bar = document.createElement("div");
+    bar.className = "guided-camera-bar";
+    var cancelBtn = document.createElement("button");
+    cancelBtn.textContent = "取消";
+    var nativeBtn = document.createElement("button");
+    nativeBtn.textContent = "改用原生相機";
+    var shutterBtn = document.createElement("button");
+    shutterBtn.className = "shutter";
+    shutterBtn.textContent = "拍照";
+    bar.appendChild(cancelBtn);
+    bar.appendChild(shutterBtn);
+    bar.appendChild(nativeBtn);
+    wrap.appendChild(bar);
+
+    document.body.appendChild(wrap);
+
+    var cleanedUp = false;
+    function stopStream(){
+      try{ stream.getTracks().forEach(function(t){ t.stop(); }); }catch(e){}
+    }
+    function cleanup(){
+      if(cleanedUp) return;
+      cleanedUp = true;
+      stopStream();
+      window.removeEventListener("resize", updateMask);
+      window.removeEventListener("orientationchange", updateMask);
+      wrap.remove();
+    }
+
+    function updateMask(){
+      var vw = video.videoWidth, vh = video.videoHeight;
+      if(!vw || !vh) return;
+      var cw = window.innerWidth, ch = window.innerHeight;
+      var scale = Math.min(cw / vw, ch / vh);
+      var dispW = vw * scale, dispH = vh * scale;
+      var dispLeft = (cw - dispW) / 2, dispTop = (ch - dispH) / 2;
+      var rect = computeCropRect(vw, vh);
+      mask.style.left = (dispLeft + rect.x * scale) + "px";
+      mask.style.top = (dispTop + rect.y * scale) + "px";
+      mask.style.width = (rect.w * scale) + "px";
+      mask.style.height = (rect.h * scale) + "px";
+    }
+
+    video.addEventListener("loadedmetadata", updateMask);
+    window.addEventListener("resize", updateMask);
+    window.addEventListener("orientationchange", updateMask);
+    video.play().catch(function(){});
+
+    cancelBtn.addEventListener("click", cleanup);
+
+    nativeBtn.addEventListener("click", function(){
+      cleanup();
+      capturePhoto(onDone);
+    });
+
+    shutterBtn.addEventListener("click", function(){
+      var vw = video.videoWidth, vh = video.videoHeight;
+      if(!vw || !vh){ toast("相機尚未就緒，請稍等一下再拍"); return; }
+      var canvas = document.createElement("canvas");
+      canvas.width = vw; canvas.height = vh;
+      var ctx = canvas.getContext("2d");
+      ctx.drawImage(video, 0, 0, vw, vh);
+      var finish = function(blob){
+        cleanup();
+        if(!blob){ toast("拍照失敗，請重試"); return; }
+        compressImage(blob, onDone);
+      };
+      if(canvas.toBlob){
+        canvas.toBlob(finish, "image/jpeg", 0.92);
+      } else {
+        finish(dataUrlToBlob(canvas.toDataURL("image/jpeg", 0.92)));
+      }
+    });
+  }
+
   document.getElementById("btnAdd").addEventListener("click", function(){
     if(!state.caseId){
       openCaseEditor(true);
@@ -1413,7 +1560,7 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var n,r,i,a,
   }
 
   function addPhotoToItemShot(item, shotKey){
-    capturePhoto(function(blob){
+    openGuidedCamera(function(blob){
       var shots = ensureShots(item);
       var oldRef = shots[shotKey];
       toast("儲存中…");
@@ -1436,7 +1583,7 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var n,r,i,a,
     d.sections[sectionKey].push(entry);
     saveCaseData();
     render();
-    capturePhoto(function(blob){
+    openGuidedCamera(function(blob){
       toast("儲存中…");
       storePhotoBlob(blob).then(function(ref){
         entry.photo = ref;
@@ -1448,7 +1595,7 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var n,r,i,a,
   }
 
   function retakeSectionPhoto(entry){
-    capturePhoto(function(blob){
+    openGuidedCamera(function(blob){
       var oldRef = entry.photo;
       toast("儲存中…");
       storePhotoBlob(blob).then(function(ref){
@@ -1471,33 +1618,36 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var n,r,i,a,
 
   // Compresses to roughly 2:3 print quality (long edge ~1600px) and hands
   // back a JPEG Blob ready for OPFS storage.
+  // Shared by compressImage() and the live camera crop-guide overlay, so
+  // the guide the person sees while framing the shot and the crop actually
+  // applied afterward can never drift apart.
+  function computeCropRect(srcW, srcH){
+    var isPortrait = srcH >= srcW;
+    var targetRatio = isPortrait ? (2 / 3) : (3 / 2); // width / height
+    var srcRatio = srcW / srcH;
+    var cropX, cropY, cropW, cropH;
+    if(srcRatio > targetRatio){
+      cropH = srcH;
+      cropW = Math.round(srcH * targetRatio);
+      cropX = Math.round((srcW - cropW) / 2);
+      cropY = 0;
+    } else {
+      cropW = srcW;
+      cropH = Math.round(srcW / targetRatio);
+      cropX = 0;
+      cropY = Math.round((srcH - cropH) / 2);
+    }
+    return { x: cropX, y: cropY, w: cropW, h: cropH };
+  }
+
   function compressImage(file, cb){
     var reader = new FileReader();
     reader.onload = function(ev){
       var img = new Image();
       img.onload = function(){
         var srcW = img.width, srcH = img.height;
-
-        // Center-crop to a 2:3 print ratio, matching whichever orientation
-        // the photo was actually taken in (landscape shots -> 4:3 wide,
-        // portrait shots -> 3:4 tall).
-        var isPortrait = srcH >= srcW;
-        var targetRatio = isPortrait ? (2 / 3) : (3 / 2); // width / height
-        var srcRatio = srcW / srcH;
-        var cropX, cropY, cropW, cropH;
-        if(srcRatio > targetRatio){
-          // source is relatively wider than 2:3 -> trim left/right
-          cropH = srcH;
-          cropW = Math.round(srcH * targetRatio);
-          cropX = Math.round((srcW - cropW) / 2);
-          cropY = 0;
-        } else {
-          // source is relatively taller than 2:3 -> trim top/bottom
-          cropW = srcW;
-          cropH = Math.round(srcW / targetRatio);
-          cropX = 0;
-          cropY = Math.round((srcH - cropH) / 2);
-        }
+        var rect = computeCropRect(srcW, srcH);
+        var cropX = rect.x, cropY = rect.y, cropW = rect.w, cropH = rect.h;
 
         var maxDim = 1600; // long edge — good print quality
         var scale = Math.min(1, maxDim / Math.max(cropW, cropH));
