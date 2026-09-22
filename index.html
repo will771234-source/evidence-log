@@ -205,6 +205,17 @@
     text-align:center; color:#fff; font-size:12.5px; text-shadow:0 1px 3px rgba(0,0,0,.8);
     pointer-events:none;
   }
+  .guided-camera .orientation-gate{
+    position:absolute; inset:0; background:rgba(0,0,0,.72); z-index:2;
+    display:flex; flex-direction:column; align-items:center; justify-content:center;
+    gap:14px; text-align:center; padding:0 30px;
+  }
+  .guided-camera .orientation-gate .rotate-icon{ font-size:44px; animation:rotateHint 1.6s ease-in-out infinite; }
+  .guided-camera .orientation-gate div.msg{ color:#fff; font-size:15px; font-weight:600; line-height:1.6; }
+  @keyframes rotateHint{
+    0%,100%{ transform:rotate(0deg); }
+    50%{ transform:rotate(-90deg); }
+  }
   .guided-camera-bar{
     position:absolute; left:0; right:0; bottom:0;
     padding:16px 20px calc(16px + env(safe-area-inset-bottom));
@@ -1590,6 +1601,12 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var n,r,i,a,
     hint.textContent = "框線內＝實際會保留的範圍（2:3）";
     wrap.appendChild(hint);
 
+    var gate = document.createElement("div");
+    gate.className = "orientation-gate";
+    gate.innerHTML = '<div class="rotate-icon">📱</div><div class="msg">請將手機轉為橫向才能拍照</div>';
+    gate.style.display = "none";
+    wrap.appendChild(gate);
+
     var track = stream.getVideoTracks()[0];
     var caps = (track && track.getCapabilities) ? track.getCapabilities() : {};
 
@@ -1692,6 +1709,8 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var n,r,i,a,
       stopStream();
       window.removeEventListener("resize", updateMask);
       window.removeEventListener("orientationchange", updateMask);
+      window.removeEventListener("resize", updateOrientationGate);
+      window.removeEventListener("orientationchange", updateOrientationGate);
       wrap.remove();
     }
 
@@ -1709,9 +1728,21 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var n,r,i,a,
       mask.style.height = (rect.h * scale) + "px";
     }
 
+    function updateOrientationGate(){
+      var landscape = window.innerWidth > window.innerHeight;
+      gate.style.display = landscape ? "none" : "flex";
+      mask.style.visibility = landscape ? "visible" : "hidden";
+      hint.style.visibility = landscape ? "visible" : "hidden";
+      shutterBtn.disabled = !landscape;
+      shutterBtn.style.opacity = landscape ? "1" : "0.35";
+    }
+
     video.addEventListener("loadedmetadata", updateMask);
     window.addEventListener("resize", updateMask);
     window.addEventListener("orientationchange", updateMask);
+    window.addEventListener("resize", updateOrientationGate);
+    window.addEventListener("orientationchange", updateOrientationGate);
+    updateOrientationGate();
     video.play().catch(function(){});
 
     cancelBtn.addEventListener("click", cleanup);
@@ -1722,6 +1753,10 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var n,r,i,a,
     });
 
     shutterBtn.addEventListener("click", function(){
+      if(window.innerWidth <= window.innerHeight){
+        toast("請先把手機轉成橫向再拍照");
+        return;
+      }
       var vw = video.videoWidth, vh = video.videoHeight;
       if(!vw || !vh){ toast("相機尚未就緒，請稍等一下再拍"); return; }
       var canvas = document.createElement("canvas");
