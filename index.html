@@ -269,7 +269,7 @@
       width: 220px; min-width: 220px; height: 100vh; overflow-y: auto;
       border-right: 1px solid var(--line);
       display: flex; flex-direction: column; gap: 8px;
-      padding: 12px 12px calc(12px + env(safe-area-inset-bottom));
+      padding: 12px 12px calc(12px + env(safe-area-inset-bottom)) calc(12px + env(safe-area-inset-left));
       transition: width .18s ease, min-width .18s ease, padding .18s ease, opacity .18s ease;
     }
     body.sidebar-collapsed .appchrome{
@@ -291,13 +291,13 @@
 
     .sidebar-toggle{
       display: flex; align-items: center; justify-content: center;
-      position: fixed; top: 50%; left: 220px; transform: translateY(-50%);
+      position: fixed; top: 50%; left: calc(220px + env(safe-area-inset-left)); transform: translateY(-50%);
       width: 20px; height: 46px; border-radius: 0 8px 8px 0;
       background: var(--bg-panel); border: 1px solid var(--line); border-left: none;
       color: var(--ink-dim); font-size: 13px; z-index: 15; padding: 0;
       transition: left .18s ease;
     }
-    body.sidebar-collapsed .sidebar-toggle{ left: 0; }
+    body.sidebar-collapsed .sidebar-toggle{ left: env(safe-area-inset-left); }
 
     main{
       flex: 1; height: 100vh; overflow-y: auto;
