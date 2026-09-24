@@ -258,25 +258,47 @@
   }
   .mic-btn.listening{ background:var(--danger); color:#fff; border-color:var(--danger); }
 
+  .sidebar-toggle{ display:none; }
+
   @media (orientation: landscape) and (min-width: 640px){
     body{
       display: flex; flex-direction: row; align-items: stretch;
       height: 100vh; overflow: hidden; padding-bottom: 0;
     }
     .appchrome{
-      width: 300px; min-width: 300px; height: 100vh; overflow-y: auto;
+      width: 220px; min-width: 220px; height: 100vh; overflow-y: auto;
       border-right: 1px solid var(--line);
-      display: flex; flex-direction: column; gap: 10px;
-      padding: 14px 14px calc(14px + env(safe-area-inset-bottom));
+      display: flex; flex-direction: column; gap: 8px;
+      padding: 12px 12px calc(12px + env(safe-area-inset-bottom));
+      transition: width .18s ease, min-width .18s ease, padding .18s ease, opacity .18s ease;
+    }
+    body.sidebar-collapsed .appchrome{
+      width: 0; min-width: 0; padding-left: 0; padding-right: 0;
+      opacity: 0; overflow: hidden; border-right: none;
     }
     .appchrome header.topbar{
       position: static; border-bottom: none; padding: 0;
     }
+    .appchrome .brand h1{ font-size: 14.5px; }
+    .appchrome .case-switch{ font-size: 11px; padding: 4px 8px; }
+    .appchrome .caseline{ font-size: 11.5px; gap: 3px 10px; }
     .toolbar, .tabbar, .prefixbar{ max-width: none; margin-top: 0; }
-    .toolbar{ flex-direction: column; }
-    .toolbar button{ flex: none; }
-    .tabbar{ flex-direction: column; }
-    .prefixbar{ flex-direction: column; align-items: flex-start; gap: 8px; }
+    .toolbar{ flex-direction: column; gap: 6px; }
+    .toolbar button{ flex: none; padding: 7px 8px; font-size: 11.5px; }
+    .tabbar{ flex-direction: column; gap: 6px; }
+    .tabbar .tabbtn{ padding: 7px 4px; font-size: 11.5px; }
+    .prefixbar{ flex-direction: column; align-items: flex-start; gap: 6px; padding: 8px 10px; font-size: 11.5px; }
+
+    .sidebar-toggle{
+      display: flex; align-items: center; justify-content: center;
+      position: fixed; top: 50%; left: 220px; transform: translateY(-50%);
+      width: 20px; height: 46px; border-radius: 0 8px 8px 0;
+      background: var(--bg-panel); border: 1px solid var(--line); border-left: none;
+      color: var(--ink-dim); font-size: 13px; z-index: 15; padding: 0;
+      transition: left .18s ease;
+    }
+    body.sidebar-collapsed .sidebar-toggle{ left: 0; }
+
     main{
       flex: 1; height: 100vh; overflow-y: auto;
       padding: 16px 22px calc(96px + env(safe-area-inset-bottom));
@@ -332,6 +354,8 @@
     <button id="btnSwitchPrefix">切換／新增編號</button>
   </div>
 </div>
+
+<button id="btnSidebarToggle" class="sidebar-toggle" title="收合／展開側邊欄">‹</button>
 
 <main>
   <div id="emptyState" class="empty" style="display:none;">
@@ -1707,6 +1731,7 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var n,r,i,a,
       if(cleanedUp) return;
       cleanedUp = true;
       stopStream();
+      clearInterval(orientationPoll);
       window.removeEventListener("resize", updateMask);
       window.removeEventListener("orientationchange", updateMask);
       window.removeEventListener("resize", updateOrientationGate);
@@ -1721,7 +1746,11 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var n,r,i,a,
       var scale = Math.min(cw / vw, ch / vh);
       var dispW = vw * scale, dispH = vh * scale;
       var dispLeft = (cw - dispW) / 2, dispTop = (ch - dispH) / 2;
-      var rect = computeCropRect(vw, vh);
+      // Use the window's own orientation (reliable) rather than the video
+      // track's self-reported width/height (can be stale right after a
+      // rotation on iOS Safari) to decide which crop ratio to show.
+      var winPortrait = cw <= ch;
+      var rect = computeCropRect(vw, vh, winPortrait);
       mask.style.left = (dispLeft + rect.x * scale) + "px";
       mask.style.top = (dispTop + rect.y * scale) + "px";
       mask.style.width = (rect.w * scale) + "px";
@@ -1742,6 +1771,12 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var n,r,i,a,
     window.addEventListener("orientationchange", updateMask);
     window.addEventListener("resize", updateOrientationGate);
     window.addEventListener("orientationchange", updateOrientationGate);
+    // iOS's orientationchange/resize events have a documented history of
+    // firing before window.innerWidth/innerHeight (or the video track's own
+    // dimensions) actually reflect the new orientation. A cheap polling
+    // fallback catches whatever the events miss, rather than trusting them
+    // alone — this is what actually fixes "portrait stays unlocked".
+    var orientationPoll = setInterval(function(){ updateMask(); updateOrientationGate(); }, 400);
     updateOrientationGate();
     video.play().catch(function(){});
 
@@ -1766,7 +1801,11 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var n,r,i,a,
       var finish = function(blob){
         cleanup();
         if(!blob){ toast("拍照失敗，請重試"); return; }
-        compressImage(blob, onDone);
+        // The shutter only works once the orientation gate confirms
+        // landscape (checked just above), so force that here too rather
+        // than trusting the video track's own dimensions, for the same
+        // staleness reason as updateMask().
+        compressImage(blob, onDone, false);
       };
       if(canvas.toBlob){
         canvas.toBlob(finish, "image/jpeg", 0.92);
@@ -1887,8 +1926,14 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var n,r,i,a,
   // Shared by compressImage() and the live camera crop-guide overlay, so
   // the guide the person sees while framing the shot and the crop actually
   // applied afterward can never drift apart.
-  function computeCropRect(srcW, srcH){
-    var isPortrait = srcH >= srcW;
+  function computeCropRect(srcW, srcH, forcePortrait){
+    // Normally infer orientation from the source's own pixel dimensions —
+    // reliable for a static decoded image file. But a *live* getUserMedia
+    // video's reported videoWidth/videoHeight is known to sometimes not
+    // update correctly right after a device rotation on iOS Safari, so
+    // callers dealing with the live camera pass forcePortrait based on the
+    // window's own orientation instead, which doesn't have that problem.
+    var isPortrait = (typeof forcePortrait === "boolean") ? forcePortrait : (srcH >= srcW);
     var targetRatio = isPortrait ? (2 / 3) : (3 / 2); // width / height
     var srcRatio = srcW / srcH;
     var cropX, cropY, cropW, cropH;
@@ -1906,13 +1951,13 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var n,r,i,a,
     return { x: cropX, y: cropY, w: cropW, h: cropH };
   }
 
-  function compressImage(file, cb){
+  function compressImage(file, cb, forcePortrait){
     var reader = new FileReader();
     reader.onload = function(ev){
       var img = new Image();
       img.onload = function(){
         var srcW = img.width, srcH = img.height;
-        var rect = computeCropRect(srcW, srcH);
+        var rect = computeCropRect(srcW, srcH, forcePortrait);
         var cropX = rect.x, cropY = rect.y, cropW = rect.w, cropH = rect.h;
 
         var maxDim = 1600; // long edge — good print quality
@@ -3060,6 +3105,23 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var n,r,i,a,
       showTextListModal();
     });
   });
+
+  // ---------- landscape sidebar collapse ----------
+  var SIDEBAR_COLLAPSED_KEY = "ev_sidebar_collapsed";
+  (function(){
+    var toggleBtn = document.getElementById("btnSidebarToggle");
+    if(!toggleBtn) return;
+    function applyState(collapsed){
+      document.body.classList.toggle("sidebar-collapsed", collapsed);
+      toggleBtn.textContent = collapsed ? "›" : "‹";
+    }
+    applyState(localStorage.getItem(SIDEBAR_COLLAPSED_KEY) === "1");
+    toggleBtn.addEventListener("click", function(){
+      var collapsed = !document.body.classList.contains("sidebar-collapsed");
+      applyState(collapsed);
+      localStorage.setItem(SIDEBAR_COLLAPSED_KEY, collapsed ? "1" : "0");
+    });
+  })();
 
   // ---------- boot ----------
   function boot(){
